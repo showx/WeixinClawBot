@@ -12,8 +12,9 @@ import (
 )
 
 type Server struct {
-	App   *App
-	Token string
+	App    *App
+	Token  string
+	Listen string
 }
 
 func (s *Server) Handler() http.Handler {
@@ -33,11 +34,14 @@ func (s *Server) Handler() http.Handler {
 		s.send(w, r)
 	})
 	mux.HandleFunc("/v1/accounts", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
+		switch r.Method {
+		case http.MethodGet:
+			s.accounts(w, r)
+		case http.MethodDelete:
+			s.removeAccount(w, r)
+		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
 		}
-		s.accounts(w, r)
 	})
 	mux.HandleFunc("/v1/sessions", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -46,6 +50,9 @@ func (s *Server) Handler() http.Handler {
 		}
 		s.sessions(w, r)
 	})
+	mux.HandleFunc("/v1/desk", s.desk)
+	mux.HandleFunc("/v1/login", s.login)
+	mux.HandleFunc("/v1/login/code", s.loginCode)
 	return mux
 }
 
@@ -101,14 +108,7 @@ func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
 	for _, group := range grouped {
 		sessions := make([]map[string]any, 0, len(group.Sessions))
 		for _, item := range group.Sessions {
-			view := DescribeSession(item, now)
-			sessions = append(sessions, map[string]any{
-				"user_id":            view.UserID,
-				"updated_at":         view.UpdatedAt.Format(time.RFC3339),
-				"sent_since_inbound": view.SentCount,
-				"status":             view.Status,
-				"detail":             view.Detail,
-			})
+			sessions = append(sessions, sessionView(item, now))
 		}
 		out = append(out, map[string]any{
 			"account":  group.Account.Name,
@@ -127,14 +127,39 @@ func accountViews(list []store.Account) []map[string]string {
 	return out
 }
 
-func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
-	got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	got = strings.TrimSpace(got)
-	if subtle.ConstantTimeCompare([]byte(got), []byte(s.Token)) != 1 {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "本地接口令牌不正确"})
-		return false
+func sessionView(item store.Session, now time.Time) map[string]any {
+	view := DescribeSession(item, now)
+	return map[string]any{
+		"user_id":            view.UserID,
+		"updated_at":         view.UpdatedAt.Format(time.RFC3339),
+		"sent_since_inbound": view.SentCount,
+		"status":             view.Status,
+		"detail":             view.Detail,
 	}
-	return true
+}
+
+func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
+	if tokenMatches(s.Token, bearerToken(r)) || tokenMatches(s.Token, cookieToken(r)) {
+		return true
+	}
+	writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "本地接口令牌不正确"})
+	return false
+}
+
+func bearerToken(r *http.Request) string {
+	return strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+}
+
+func cookieToken(r *http.Request) string {
+	cookie, err := r.Cookie("weixin_gui")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(cookie.Value)
+}
+
+func tokenMatches(want, got string) bool {
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
 func statusOf(err error) int {

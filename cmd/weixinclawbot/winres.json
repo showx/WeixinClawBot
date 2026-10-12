@@ -1,0 +1,17 @@
+{
+  "RT_MANIFEST": {
+    "#1": {
+      "0409": {
+        "identity": {
+          "name": "WeixinClawBot",
+          "version": "1.0.0.0"
+        },
+        "description": "微信 ClawBot",
+        "minimum-os": "win7",
+        "execution-level": "as invoker",
+        "dpi-awareness": "system",
+        "use-common-controls-v6": true
+      }
+    }
+  }
+}

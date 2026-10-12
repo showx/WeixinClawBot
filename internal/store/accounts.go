@@ -133,6 +133,41 @@ func (c *Catalog) Upsert(preferredName string, creds Credentials) (Account, erro
 	return account, nil
 }
 
+// Remove 从列表里去掉一个微信。账号目录仍留在数据目录中，再次扫码同一个微信会恢复会话。
+func (c *Catalog) Remove(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ErrAccountRequired
+	}
+	file, err := c.load()
+	if err != nil {
+		return err
+	}
+	kept := make([]Account, 0, len(file.Accounts))
+	found := false
+	for _, item := range file.Accounts {
+		if item.Name == name {
+			found = true
+			continue
+		}
+		kept = append(kept, item)
+	}
+	if !found {
+		return ErrAccountNotFound
+	}
+	file.Accounts = kept
+	return c.save(file)
+}
+
+// ValidateAccountName 检查管理界面里填写的微信名称。
+func ValidateAccountName(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("请填写微信名称")
+	}
+	return validAccountName(name)
+}
+
 // Open 按名称打开一个微信。名称为空时，只有恰好一个微信才能打开。
 func (c *Catalog) Open(name string) (Bound, error) {
 	name = strings.TrimSpace(name)

@@ -55,6 +55,21 @@ func TestCatalogSeparatesWechats(t *testing.T) {
 	if _, err := catalog.Upsert("工作", Credentials{BotToken: "other", BaseURL: "https://other.test", BotID: "other@im.bot"}); !errors.Is(err, ErrNameTaken) {
 		t.Fatalf("重名应拒绝: %v", err)
 	}
+	if err := catalog.Remove("生活"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := catalog.Open("生活"); !errors.Is(err, ErrAccountNotFound) {
+		t.Fatalf("移除后不应再打开: %v", err)
+	}
+	if err := catalog.Remove("生活"); !errors.Is(err, ErrAccountNotFound) {
+		t.Fatalf("再次移除应找不到: %v", err)
+	}
+	if err := ValidateAccountName(" "); err == nil {
+		t.Fatal("空名称应拒绝")
+	}
+	if err := ValidateAccountName("a/b"); err == nil {
+		t.Fatal("斜杠名称应拒绝")
+	}
 	renamed, err := catalog.Upsert("工作号", Credentials{BotToken: "work2", BaseURL: "https://work.test", BotID: "work@im.bot", UserID: "work@im.wechat"})
 	if err != nil || renamed.Name != "工作号" {
 		t.Fatalf("再次登录应更新原微信: %+v err=%v", renamed, err)

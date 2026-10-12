@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,17 +16,26 @@ import (
 
 	"weixinclawbot/internal/app"
 	"weixinclawbot/internal/ilink"
+	"weixinclawbot/internal/schedule"
 	"weixinclawbot/internal/store"
 	"weixinclawbot/internal/tui"
+	"weixinclawbot/internal/winui"
 )
 
 func main() {
 	log.SetFlags(log.LstdFlags)
+	var err error
 	if len(os.Args) < 2 {
+		if noConsole() {
+			err = cmdGUI(nil)
+			if err != nil {
+				os.Exit(1)
+			}
+			return
+		}
 		usage()
 		os.Exit(2)
 	}
-	var err error
 	switch os.Args[1] {
 	case "login":
 		err = cmdLogin(os.Args[2:])
@@ -33,6 +43,8 @@ func main() {
 		err = cmdAccounts(os.Args[2:])
 	case "list", "tui":
 		err = cmdList(os.Args[2:])
+	case "gui":
+		err = cmdGUI(os.Args[2:])
 	case "serve":
 		err = cmdServe(os.Args[2:])
 	case "send":
@@ -54,14 +66,16 @@ func main() {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `用法:
-  weixinclawbot login [-name 名称]              扫码登录一个微信，可重复执行以添加多个
+  weixinclawbot gui                             打开桌面窗口，并监听全部已登录微信
+  weixinclawbot login [-name 名称]              在命令行扫码登录一个微信
   weixinclawbot list                            在终端里查看全部微信和会话
-  weixinclawbot serve [-account 名称]           监听一个或全部微信，并开放发消息接口
+  weixinclawbot serve [-account 名称]           监听微信，并开放发消息接口
   weixinclawbot send [-account 名称] [-to 用户] 文本
   weixinclawbot sessions [-account 名称]        查看可以发送的会话
 
 多个微信时，send 和只看某一个会话都要带 -account。名称示例：-name 工作
 状态目录默认是 ./data，可用环境变量 WEIXIN_DATA_DIR 或参数 -data 修改。
+gui 和 serve 开着时会执行定时任务，并把结果发到指定微信。
 `)
 }
 
@@ -168,10 +182,26 @@ func cmdAccounts(args []string) error {
 	return nil
 }
 
+func cmdGUI(args []string) error {
+	fs := flag.NewFlagSet("gui", flag.ExitOnError)
+	dir := dataDirFlag(fs)
+	listen := fs.String("listen", envOr("WEIXIN_LISTEN", "127.0.0.1:8787"), "本机发消息接口地址")
+	_ = fs.Parse(args)
+	application, err := openApp(*dir)
+	if err != nil {
+		return err
+	}
+	token, err := apiToken(application)
+	if err != nil {
+		return err
+	}
+	return winui.Run(application, *listen, token)
+}
+
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	dir := dataDirFlag(fs)
-	listen := fs.String("listen", envOr("WEIXIN_LISTEN", "127.0.0.1:8787"), "本地发消息接口地址")
+	listen := fs.String("listen", envOr("WEIXIN_LISTEN", "127.0.0.1:8787"), "本机发消息接口地址")
 	account := fs.String("account", "", "只监听这个微信；省略则监听全部已登录微信")
 	_ = fs.Parse(args)
 	application, err := openApp(*dir)
@@ -181,27 +211,49 @@ func cmdServe(args []string) error {
 	if _, err := application.ReadyAccounts(*account); err != nil {
 		return err
 	}
-	token := os.Getenv("WEIXIN_API_TOKEN")
-	if token == "" {
-		token, err = application.Catalog.APIToken()
-		if err != nil {
-			return err
+	token, err := apiToken(application)
+	if err != nil {
+		return err
+	}
+	watch := application.Supervise
+	if strings.TrimSpace(*account) != "" {
+		name := *account
+		watch = func(ctx context.Context) error {
+			return application.WatchAccounts(ctx, name)
 		}
 	}
+	return serveLoop(application, *listen, token, watch)
+}
+
+func serveLoop(application *app.App, listen, token string, watch func(context.Context) error) error {
+	ln, err := net.Listen("tcp", listen)
+	if err != nil {
+		return err
+	}
+	page := browserURL(ln.Addr().String())
 	srv := &http.Server{
-		Addr:              *listen,
-		Handler:           (&app.Server{App: application, Token: token}).Handler(),
+		Handler:           (&app.Server{App: application, Token: token, Listen: strings.TrimSuffix(strings.TrimPrefix(page, "http://"), "/")}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
-	log.Printf("发消息接口: POST http://%s/v1/messages", *listen)
+	log.Printf("发消息接口: POST %sv1/messages", page)
 	log.Printf("本地接口令牌: %s", token)
+	if application.Catalog != nil {
+		book, err := schedule.Open(application.Catalog.Dir())
+		if err != nil {
+			log.Printf("定时任务未启动: %v", err)
+		} else {
+			go book.Loop(ctx, func(ctx context.Context, account, to, text string) error {
+				_, err := application.SendAccount(ctx, account, to, text)
+				return err
+			})
+		}
+	}
 
 	listenErr := make(chan error, 1)
 	go func() {
-		err := srv.ListenAndServe()
+		err := srv.Serve(ln)
 		if errors.Is(err, http.ErrServerClosed) {
 			listenErr <- nil
 			return
@@ -210,7 +262,7 @@ func cmdServe(args []string) error {
 	}()
 	watchErr := make(chan error, 1)
 	go func() {
-		watchErr <- application.WatchAccounts(ctx, *account)
+		watchErr <- watch(ctx)
 	}()
 
 	select {
@@ -227,6 +279,25 @@ func cmdServe(args []string) error {
 		<-watchErr
 		return err
 	}
+}
+
+func apiToken(application *app.App) (string, error) {
+	if token := strings.TrimSpace(os.Getenv("WEIXIN_API_TOKEN")); token != "" {
+		return token, nil
+	}
+	return application.Catalog.APIToken()
+}
+
+func browserURL(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "http://" + strings.TrimRight(addr, "/") + "/"
+	}
+	switch host {
+	case "", "::", "0.0.0.0", "[::]":
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port) + "/"
 }
 
 func cmdSend(args []string) error {

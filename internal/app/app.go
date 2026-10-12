@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"weixinclawbot/internal/ilink"
@@ -36,6 +37,11 @@ type App struct {
 	Name    string
 	Client  *ilink.Client
 	Log     *log.Logger
+
+	deskOnce sync.Once
+	desk     *deskLogin
+	watchMu  sync.Mutex
+	watching []string
 }
 
 func (a *App) logger() *log.Logger {

@@ -6,6 +6,24 @@
 
 ## 使用
 
+桌面程序：
+
+```bash
+go build -ldflags "-H windowsgui" -o WeixinClawBot.exe ./cmd/weixinclawbot
+```
+
+双击 `WeixinClawBot.exe` 打开窗口。也可以：
+
+```bash
+go run ./cmd/weixinclawbot gui
+```
+
+在窗口里扫码添加微信、看每个会话能不能发、直接写消息。窗口开着就会监听已登录的微信，之后新扫码的也会自动开始监听。关掉窗口就停止监听。
+
+窗口里的「定时任务」可以每天固定时间，或每隔若干分钟，把一段文字、一条本机命令的输出，或一个网页正文里的文字，发到指定微信。抓取页面时填写 http 或 https 网址。普通网页直接读正文；靠脚本画出来的页面，会用本机已经登录的 Edge 或 Chrome 打开，等页面和请求都加载完再读出文字，然后关掉这个新窗口。接收者留空时发给该微信最近的会话。新建的任务不会马上执行。桌面窗口或 `serve` 开着才会到点运行；每天的任务如果当天过了时间还没跑，只补今天这一次。任务保存在数据目录的 `schedules.json`。命令大约最多执行 45 秒，页面大约最多等待 75 秒，输出过长会截断后再发送。
+
+命令行仍然可用：
+
 ```bash
 go run ./cmd/weixinclawbot login -name 工作
 go run ./cmd/weixinclawbot login -name 生活
@@ -25,7 +43,7 @@ go run ./cmd/weixinclawbot send -account 工作 -to 用户ID 你好
 go run ./cmd/weixinclawbot sessions
 ```
 
-`serve` 同时监听 `127.0.0.1:8787`。本地令牌启动时打印，也保存在 `data/api_token.txt`。
+`serve` 和桌面窗口都在 `127.0.0.1:8787` 提供发消息接口。本地令牌启动时打印，也保存在 `data/api_token.txt`，窗口里可以复制。
 
 ```bash
 curl -X POST http://127.0.0.1:8787/v1/messages \
