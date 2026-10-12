@@ -1,4 +1,9 @@
 {
+  "RT_GROUP_ICON": {
+    "#1": {
+      "0000": "icon.png"
+    }
+  },
   "RT_MANIFEST": {
     "#1": {
       "0409": {

@@ -23,6 +23,14 @@ import (
 	"weixinclawbot/internal/schedule"
 )
 
+func appIcon() *walk.Icon {
+	icon, err := walk.NewIconFromResourceId(1)
+	if err != nil {
+		return nil
+	}
+	return icon
+}
+
 // Run 打开 Windows 桌面窗口，并在后台监听已登录的微信。
 func Run(application *app.App, listen, token string) error {
 	err := run(application, listen, token)
@@ -78,6 +86,7 @@ func openWindow(application *app.App, book *schedule.Book, ctx context.Context, 
 	}
 	if err := (MainWindow{
 		AssignTo: &ui.mw,
+		Icon:     appIcon(),
 		Title:    "微信 ClawBot",
 		Font:     Font{Family: "Microsoft YaHei UI", PointSize: 10},
 		MinSize:  Size{Width: 860, Height: 560},
@@ -487,6 +496,7 @@ func (d *desk) showLogin(preset string, autostart bool) {
 	box := &loginBox{app: d.app}
 	err := (Dialog{
 		AssignTo: &dlg,
+		Icon:     appIcon(),
 		Title:    "添加微信",
 		Font:     Font{Family: "Microsoft YaHei UI", PointSize: 10},
 		MinSize:  Size{Width: 420, Height: 520},

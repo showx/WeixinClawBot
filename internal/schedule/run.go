@@ -129,6 +129,28 @@ func (b *Book) noteCrash(rec any) {
 }
 
 func (b *Book) produce(ctx context.Context, task Task) (text, result string, shouldSend bool) {
+	if task.Kind == KindAPI {
+		output, err := FetchAPI(ctx, task.Body)
+		output = strings.TrimSpace(output)
+		if err != nil {
+			msg := "接口获取失败：" + pageFailure(err)
+			text, truncated := truncateRunes(msg, sendRuneLimit)
+			result = "已发送接口失败说明"
+			if truncated {
+				result = "已发送接口失败说明（已截断）"
+			}
+			return text, result, true
+		}
+		if output == "" {
+			return "", "接口没有这些字段，未发送", false
+		}
+		text, truncated := truncateRunes(output, sendRuneLimit)
+		result = "已发送"
+		if truncated {
+			result = "已发送（输出已截断）"
+		}
+		return text, result, true
+	}
 	if task.Kind == KindPage {
 		fetch := b.fetchPage
 		if fetch == nil {

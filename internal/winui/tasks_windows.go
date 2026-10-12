@@ -29,6 +29,7 @@ func (d *desk) tasks() {
 	var runBtn *walk.PushButton
 	err := (Dialog{
 		AssignTo: &dlg,
+		Icon:     appIcon(),
 		Title:    "定时任务",
 		Font:     Font{Family: "Microsoft YaHei UI", PointSize: 10},
 		MinSize:  Size{Width: 720, Height: 460},
@@ -298,6 +299,7 @@ func editTask(owner walk.Form, book *schedule.Book, accounts []string, current s
 	}
 	err := (Dialog{
 		AssignTo: &dlg,
+		Icon:     appIcon(),
 		Title:    title,
 		Font:     Font{Family: "Microsoft YaHei UI", PointSize: 10},
 		MinSize:  Size{Width: 460, Height: 560},
@@ -322,7 +324,7 @@ func editTask(owner walk.Form, book *schedule.Book, accounts []string, current s
 			Label{Text: "发送什么"},
 			ComboBox{
 				AssignTo:              &kindBox,
-				Model:                 []string{"固定文本", "运行命令", "抓取页面"},
+				Model:                 []string{"固定文本", "运行命令", "抓取页面", "接口数据"},
 				OnCurrentIndexChanged: func() { editor.applyKind() },
 			},
 			Label{AssignTo: &hint, Text: "到点把这段文字发给上面的微信。"},
@@ -371,6 +373,8 @@ func editTask(owner walk.Form, book *schedule.Book, accounts []string, current s
 		kindIndex = 1
 	case schedule.KindPage:
 		kindIndex = 2
+	case schedule.KindAPI:
+		kindIndex = 3
 	}
 	_ = kindBox.SetCurrentIndex(kindIndex)
 	editor.applyMode()
@@ -421,6 +425,8 @@ func (e *taskEditor) applyKind() {
 		e.hint.SetText("到点运行这条命令，把输出发给上面的微信。命令大约最多跑 45 秒。")
 	case 2:
 		e.hint.SetText("到点用已经登录的 Chrome 或 Edge 打开网址，等页面和请求都加载完再读出文字，然后关掉这个窗口。")
+	case 3:
+		e.hint.SetText("第一行写接口地址。下面每行一个字段，例如 data.total 或 data.list.0.name。需要令牌时再加一行 Header: Authorization: Bearer 令牌。")
 	default:
 		e.hint.SetText("到点把这段文字发给上面的微信。")
 	}
@@ -453,6 +459,8 @@ func (e *taskEditor) save() {
 		task.Kind = schedule.KindCommand
 	case 2:
 		task.Kind = schedule.KindPage
+	case 3:
+		task.Kind = schedule.KindAPI
 	default:
 		task.Kind = schedule.KindText
 	}

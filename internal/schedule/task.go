@@ -12,6 +12,7 @@ const (
 	KindText     = "text"
 	KindCommand  = "command"
 	KindPage     = "page"
+	KindAPI      = "api"
 	ModeDaily    = "daily"
 	ModeInterval = "interval"
 
@@ -81,32 +82,45 @@ func (t Task) Validate() error {
 		return fmt.Errorf("接收者太长")
 	}
 	switch t.Kind {
-	case KindText, KindCommand, KindPage:
+	case KindText, KindCommand, KindPage, KindAPI:
 	default:
-		return fmt.Errorf("请选择固定文本、运行命令或抓取页面")
+		return fmt.Errorf("请选择固定文本、运行命令、抓取页面或接口数据")
 	}
 	body := strings.TrimSpace(t.Body)
 	if body == "" {
-		if t.Kind == KindPage {
+		switch t.Kind {
+		case KindPage:
 			return fmt.Errorf("请填写页面网址")
+		case KindAPI:
+			return fmt.Errorf("请填写接口地址和字段")
+		default:
+			return fmt.Errorf("请填写要发送的内容")
 		}
-		return fmt.Errorf("请填写要发送的内容")
 	}
 	limit := maxTextRunes
 	switch t.Kind {
 	case KindCommand:
 		limit = maxCommandRunes
-	case KindPage:
+	case KindPage, KindAPI:
 		limit = 4000
 	}
 	if utf8.RuneCountInString(body) > limit {
-		if t.Kind == KindPage {
+		switch t.Kind {
+		case KindPage:
 			return fmt.Errorf("网址和 Cookie 最多 %d 个字", limit)
+		case KindAPI:
+			return fmt.Errorf("接口地址和字段最多 %d 个字", limit)
+		default:
+			return fmt.Errorf("内容最多 %d 个字", limit)
 		}
-		return fmt.Errorf("内容最多 %d 个字", limit)
 	}
 	if t.Kind == KindPage {
 		if _, err := parsePageBody(body); err != nil {
+			return err
+		}
+	}
+	if t.Kind == KindAPI {
+		if _, err := parseAPIBody(body); err != nil {
 			return err
 		}
 	}
@@ -148,6 +162,8 @@ func (t Task) Detail() string {
 		kind = "运行命令"
 	case KindPage:
 		kind = "抓取页面"
+	case KindAPI:
+		kind = "接口数据"
 	}
 	when := "还没有运行"
 	if !t.LastRun.IsZero() {
