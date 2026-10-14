@@ -140,7 +140,7 @@ func (a *App) ReadyAccounts(name string) ([]store.Bound, error) {
 }
 
 func (a *App) child(bound store.Bound) *App {
-	return &App{Store: bound.Store, Client: a.client(), Log: a.Log, Name: bound.Account.Name}
+	return &App{Store: bound.Store, Client: a.client(), Log: a.Log, Name: bound.Account.Name, incoming: a.incomingHook()}
 }
 
 func accountErr(err error) error {

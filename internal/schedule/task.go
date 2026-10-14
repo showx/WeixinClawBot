@@ -13,6 +13,7 @@ const (
 	KindCommand  = "command"
 	KindPage     = "page"
 	KindAPI      = "api"
+	KindBrowse   = "browse"
 	ModeDaily    = "daily"
 	ModeInterval = "interval"
 
@@ -26,6 +27,7 @@ type Task struct {
 	ID           string    `json:"id"`
 	Name         string    `json:"name"`
 	Account      string    `json:"account"`
+	Accounts     []string  `json:"accounts,omitempty"`
 	To           string    `json:"to,omitempty"`
 	Enabled      bool      `json:"enabled"`
 	Kind         string    `json:"kind"`
@@ -71,20 +73,25 @@ func (t Task) Validate() error {
 	if utf8.RuneCountInString(name) > 32 {
 		return fmt.Errorf("任务名称最多 32 个字")
 	}
-	account := strings.TrimSpace(t.Account)
-	if account == "" {
+	names := t.AccountNames()
+	if len(names) == 0 {
 		return fmt.Errorf("请选择微信")
 	}
-	if utf8.RuneCountInString(account) > 32 || strings.ContainsAny(account, `/\`) {
-		return fmt.Errorf("微信名称不能包含斜杠，最多 32 个字")
+	if len(names) > 20 {
+		return fmt.Errorf("一个任务最多选择 20 个微信")
+	}
+	for _, account := range names {
+		if utf8.RuneCountInString(account) > 32 || strings.ContainsAny(account, `/\`) {
+			return fmt.Errorf("微信名称不能包含斜杠，最多 32 个字")
+		}
 	}
 	if utf8.RuneCountInString(strings.TrimSpace(t.To)) > 128 {
 		return fmt.Errorf("接收者太长")
 	}
 	switch t.Kind {
-	case KindText, KindCommand, KindPage, KindAPI:
+	case KindText, KindCommand, KindPage, KindAPI, KindBrowse:
 	default:
-		return fmt.Errorf("请选择固定文本、运行命令、抓取页面或接口数据")
+		return fmt.Errorf("请选择固定文本、运行命令、抓取页面、接口数据或浏览分析")
 	}
 	body := strings.TrimSpace(t.Body)
 	if body == "" {
@@ -93,6 +100,8 @@ func (t Task) Validate() error {
 			return fmt.Errorf("请填写页面网址")
 		case KindAPI:
 			return fmt.Errorf("请填写接口地址和字段")
+		case KindBrowse:
+			return fmt.Errorf("请填写页面网址和要分析的问题")
 		default:
 			return fmt.Errorf("请填写要发送的内容")
 		}
@@ -101,7 +110,7 @@ func (t Task) Validate() error {
 	switch t.Kind {
 	case KindCommand:
 		limit = maxCommandRunes
-	case KindPage, KindAPI:
+	case KindPage, KindAPI, KindBrowse:
 		limit = 4000
 	}
 	if utf8.RuneCountInString(body) > limit {
@@ -110,12 +119,19 @@ func (t Task) Validate() error {
 			return fmt.Errorf("网址和 Cookie 最多 %d 个字", limit)
 		case KindAPI:
 			return fmt.Errorf("接口地址和字段最多 %d 个字", limit)
+		case KindBrowse:
+			return fmt.Errorf("网址和问题最多 %d 个字", limit)
 		default:
 			return fmt.Errorf("内容最多 %d 个字", limit)
 		}
 	}
 	if t.Kind == KindPage {
 		if _, err := parsePageBody(body); err != nil {
+			return err
+		}
+	}
+	if t.Kind == KindBrowse {
+		if _, err := parseBrowseBody(body); err != nil {
 			return err
 		}
 	}
@@ -152,7 +168,37 @@ func (t Task) Summary() string {
 	if target == "" {
 		target = "最近会话"
 	}
-	return fmt.Sprintf("%s%s  %s  %s → %s", t.Name, state, when, t.Account, target)
+	return fmt.Sprintf("%s%s  %s  %s → %s", t.Name, state, when, t.AccountLabel(), target)
+}
+
+// AccountNames 是这个任务要发送的微信。旧任务只写了 account 时仍然有效。
+func (t Task) AccountNames() []string {
+	seen := map[string]bool{}
+	var names []string
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	for _, name := range t.Accounts {
+		add(name)
+	}
+	if len(names) == 0 {
+		add(t.Account)
+	}
+	return names
+}
+
+// AccountLabel 用顿号把多个微信拼成一行。
+func (t Task) AccountLabel() string {
+	names := t.AccountNames()
+	if len(names) == 0 {
+		return ""
+	}
+	return strings.Join(names, "、")
 }
 
 func (t Task) Detail() string {
@@ -164,6 +210,8 @@ func (t Task) Detail() string {
 		kind = "抓取页面"
 	case KindAPI:
 		kind = "接口数据"
+	case KindBrowse:
+		kind = "浏览分析"
 	}
 	when := "还没有运行"
 	if !t.LastRun.IsZero() {

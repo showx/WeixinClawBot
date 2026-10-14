@@ -43,11 +43,22 @@ func (b *Book) tick(ctx context.Context, send SendFunc) {
 		return
 	}
 	now := time.Now()
+	on, err := b.SchedulerOn()
+	if err != nil {
+		log.Printf("定时任务开关读取失败: %v", err)
+		return
+	}
 	for _, task := range tasks {
 		if ctx.Err() != nil {
 			return
 		}
 		if !task.Due(now) {
+			continue
+		}
+		if !on {
+			if markErr := b.Mark(task.ID, now, "已暂停，未发送"); markErr != nil {
+				log.Printf("定时任务 %s 没能记下暂停: %v", task.Name, markErr)
+			}
 			continue
 		}
 		_, _ = b.run(ctx, task, send, false)
@@ -94,24 +105,73 @@ func (b *Book) run(ctx context.Context, task Task, send SendFunc, manual bool) (
 		return "", ctx.Err()
 	}
 	if shouldSend {
-		sendCtx, cancel := context.WithTimeout(ctx, sendTimeout)
-		err = send(sendCtx, fresh.Account, fresh.To, text)
-		cancel()
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-		if err != nil {
-			result = trimResult("发送失败：" + err.Error())
+		accounts := fresh.AccountNames()
+		if len(accounts) <= 1 {
+			account := fresh.Account
+			if len(accounts) == 1 {
+				account = accounts[0]
+			}
+			sendCtx, cancel := context.WithTimeout(ctx, sendTimeout)
+			err = send(sendCtx, account, fresh.To, text)
+			cancel()
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			if err != nil {
+				result = trimResult("发送失败：" + firstLine(err.Error()))
+				note := strings.TrimSpace(err.Error())
+				if strings.TrimSpace(text) != "" {
+					note += "\n\n准备发送的内容：\n" + text
+				}
+				text = note
+			}
+		} else {
+			var notes []string
+			var failed []string
+			outbound := text
+			for _, account := range accounts {
+				if ctx.Err() != nil {
+					return "", ctx.Err()
+				}
+				sendCtx, cancel := context.WithTimeout(ctx, sendTimeout)
+				sendErr := send(sendCtx, account, fresh.To, outbound)
+				cancel()
+				if ctx.Err() != nil {
+					return "", ctx.Err()
+				}
+				if sendErr != nil {
+					notes = append(notes, account+" 失败："+firstLine(sendErr.Error()))
+					failed = append(failed, account+"\n"+strings.TrimSpace(sendErr.Error()))
+					continue
+				}
+				notes = append(notes, account+" 已发送")
+			}
+			result = trimResult(strings.Join(notes, "；"))
+			if len(failed) > 0 {
+				note := strings.Join(notes, "\n") + "\n\n" + strings.Join(failed, "\n\n")
+				if strings.TrimSpace(outbound) != "" {
+					note += "\n\n准备发送的内容：\n" + outbound
+				}
+				text = note
+				err = errors.New(result)
+			}
 		}
 	}
-	if markErr := b.Mark(fresh.ID, time.Now(), result); markErr != nil {
+	when := time.Now()
+	if markErr := b.Mark(fresh.ID, when, result); markErr != nil {
 		log.Printf("定时任务 %s 没能记下结果: %v", fresh.Name, markErr)
 	}
+	logged := fresh
+	logged.Account = fresh.AccountLabel()
+	b.recordRun(logged, when, result, text, manual)
 	if strings.Contains(result, "失败") {
 		log.Printf("定时任务 %s：%s", fresh.Name, result)
 	}
 	if strings.HasPrefix(result, "发送失败") {
 		return result, errors.New(result)
+	}
+	if err != nil {
+		return result, err
 	}
 	return result, nil
 }
@@ -129,6 +189,34 @@ func (b *Book) noteCrash(rec any) {
 }
 
 func (b *Book) produce(ctx context.Context, task Task) (text, result string, shouldSend bool) {
+	if task.Kind == KindBrowse {
+		run := b.browse
+		if run == nil {
+			run = func(ctx context.Context, body string) (string, error) {
+				return FetchBrowse(ctx, body, filepath.Dir(b.path))
+			}
+		}
+		output, err := run(ctx, task.Body)
+		output = strings.TrimSpace(output)
+		if err != nil {
+			msg := "浏览分析失败：" + browseFailure(err)
+			text, truncated := truncateRunes(msg, sendRuneLimit)
+			result = "已发送浏览失败说明"
+			if truncated {
+				result = "已发送浏览失败说明（已截断）"
+			}
+			return text, result, true
+		}
+		if output == "" {
+			return "", "没有得出结论，未发送", false
+		}
+		text, truncated := truncateRunes(output, sendRuneLimit)
+		result = "已发送"
+		if truncated {
+			result = "已发送（输出已截断）"
+		}
+		return text, result, true
+	}
 	if task.Kind == KindAPI {
 		output, err := FetchAPI(ctx, task.Body)
 		output = strings.TrimSpace(output)
@@ -214,6 +302,14 @@ func (b *Book) produce(ctx context.Context, task Task) (text, result string, sho
 		result = "已发送（内容已截断）"
 	}
 	return text, result, true
+}
+
+func firstLine(text string) string {
+	text = strings.TrimSpace(text)
+	if i := strings.IndexAny(text, "\r\n"); i >= 0 {
+		text = strings.TrimSpace(text[:i])
+	}
+	return text
 }
 
 func pageFailure(err error) string {

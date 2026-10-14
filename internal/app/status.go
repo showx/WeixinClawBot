@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"weixinclawbot/internal/store"
@@ -16,6 +17,7 @@ type SessionStatus struct {
 	SentCount int
 	Status    string
 	Detail    string
+	LastText  string
 }
 
 // DescribeSession 根据本地记录说明当前能不能发。
@@ -26,6 +28,7 @@ func DescribeSession(item store.Session, now time.Time) SessionStatus {
 		UpdatedAt: item.UpdatedAt,
 		SentCount: item.SentCount,
 		Status:    "ready",
+		LastText:  strings.TrimSpace(item.LastText),
 	}
 	switch item.BlockReason {
 	case store.BlockExpired:

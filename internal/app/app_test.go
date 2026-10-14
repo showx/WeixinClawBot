@@ -66,18 +66,24 @@ func TestOldSessionStillTriesUntilWechatRejects(t *testing.T) {
 	application := &App{Store: st, Client: ilink.NewClient()}
 
 	_, err := application.Send(context.Background(), "", "你好")
-	if err != ErrTokenRejected || calls != 1 {
+	if !errors.Is(err, ErrTokenRejected) || calls != 1 {
 		t.Fatalf("err=%v calls=%d", err, calls)
 	}
-	_, err = application.Send(context.Background(), "", "再次")
-	if err != ErrTokenRejected || calls != 1 {
-		t.Fatalf("锁定后不应再请求微信: err=%v calls=%d", err, calls)
+	if !strings.Contains(err.Error(), "已向微信提交发送") || !strings.Contains(err.Error(), "微信返回 -2") || strings.Contains(err.Error(), "ctx-1") {
+		t.Fatalf("应写明过程且不包含令牌:\n%s", err.Error())
+	}
+	if _, err := application.Send(context.Background(), "", "再次"); err != nil || calls != 2 {
+		t.Fatalf("上次被拒后仍应再请求微信: err=%v calls=%d", err, calls)
+	}
+	item := mustSession(t, st)
+	if item.BlockReason != "" || item.SentCount != 1 {
+		t.Fatalf("微信接受后应清掉拒绝: %+v", item)
 	}
 
 	if err := st.UpsertSession("u@im.wechat", "ctx-2", time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := application.Send(context.Background(), "", "恢复"); err != nil || calls != 2 {
+	if _, err := application.Send(context.Background(), "", "恢复"); err != nil || calls != 3 {
 		t.Fatalf("新消息后应重新发送: err=%v calls=%d", err, calls)
 	}
 }
@@ -91,7 +97,7 @@ func TestRateLimitIsRemembered(t *testing.T) {
 	_ = st.SaveCredentials(store.Credentials{BotToken: "tok", BaseURL: upstream.URL, BotID: "bot"})
 	_ = st.UpsertSession("u@im.wechat", "ctx-1", time.Now())
 	_, err := (&App{Store: st, Client: ilink.NewClient()}).Send(context.Background(), "", "你好")
-	if err != ErrRateLimited {
+	if !errors.Is(err, ErrRateLimited) {
 		t.Fatalf("err=%v", err)
 	}
 	view := DescribeSession(mustSession(t, st), time.Now())
@@ -187,6 +193,58 @@ func TestTerminalQRFitsWideConsole(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "\x1b[40m") || !strings.Contains(buf.String(), "\x1b[107m") {
 		t.Fatalf("终端二维码缺少颜色块：%s", buf.String())
+	}
+}
+
+func TestWatchShowsPhoneText(t *testing.T) {
+	var polls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "getupdates") {
+			_, _ = w.Write([]byte(`{"ret":0}`))
+			return
+		}
+		polls++
+		if polls == 1 {
+			_, _ = w.Write([]byte(`{"ret":0,"msgs":[{"from_user_id":"u@im.wechat","to_user_id":"bot@im.bot","context_token":"ctx-phone","item_list":[{"type":1,"text_item":{"text":"手机上的话"}}]}]}`))
+			return
+		}
+		time.Sleep(time.Second)
+		_, _ = w.Write([]byte(`{"ret":0}`))
+	}))
+	defer upstream.Close()
+	st := openStore(t)
+	if err := st.SaveCredentials(store.Credentials{BotToken: "tok", BaseURL: upstream.URL, BotID: "bot"}); err != nil {
+		t.Fatal(err)
+	}
+	application := &App{Store: st, Client: ilink.NewClient(), Name: "工作"}
+	got := make(chan Incoming, 1)
+	application.SetOnIncoming(func(msg Incoming) {
+		if strings.Contains(msg.Text, "ctx-phone") {
+			t.Errorf("日志不应包含令牌: %+v", msg)
+		}
+		got <- msg
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- application.Watch(ctx) }()
+	select {
+	case msg := <-got:
+		if msg.Account != "工作" || msg.UserID != "u@im.wechat" || msg.Text != "手机上的话" {
+			t.Fatalf("%+v", msg)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("没有收到手机消息")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("监听没有退出")
+	}
+	item, ok, err := st.Session("u@im.wechat")
+	if err != nil || !ok || item.LastText != "手机上的话" || item.ContextToken != "ctx-phone" {
+		t.Fatalf("会话没记下手机内容: ok=%v err=%v item=%+v", ok, err, item)
 	}
 }
 

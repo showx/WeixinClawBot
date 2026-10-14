@@ -108,6 +108,20 @@ func TestSendText(t *testing.T) {
 	}
 }
 
+func TestGetUpdatesReadsPhoneText(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ret":0,"msgs":[{"from_user_id":"u@im.wechat","to_user_id":"bot@im.bot","context_token":"ctx","item_list":[{"type":1,"text_item":{"text":"手机上的话"}},{"type":2,"image_item":{}}]}]}`))
+	}))
+	defer srv.Close()
+	updates, err := NewClient().GetUpdates(context.Background(), Credentials{BotToken: "t", BaseURL: srv.URL}, "", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates.Messages) != 1 || updates.Messages[0].Text != "手机上的话\n［图片］" || updates.Messages[0].ContextToken != "ctx" {
+		t.Fatalf("%#v", updates.Messages)
+	}
+}
+
 func TestGetUpdatesTimeoutIsEmpty(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(200 * time.Millisecond)

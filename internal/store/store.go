@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -36,6 +37,7 @@ type Session struct {
 	LastSentAt   time.Time `json:"last_sent_at,omitempty"`
 	BlockReason  string    `json:"block_reason,omitempty"`
 	BlockedAt    time.Time `json:"blocked_at,omitempty"`
+	LastText     string    `json:"last_text,omitempty"`
 }
 
 type State struct {
@@ -140,6 +142,17 @@ func (s *Store) UpsertSession(userID, contextToken string, at time.Time) error {
 	return writeJSON(s.path("sessions.json"), sessions)
 }
 
+// NoteInbound 记下对方从手机发来的内容。会话必须已经存在。
+func (s *Store) NoteInbound(userID, text string) error {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	return s.updateSession(userID, func(item *Session) {
+		item.LastText = text
+	})
+}
+
 // NoteSend 累加自上次入站消息以来微信已接受的条数。
 func (s *Store) NoteSend(userID string, n int) error {
 	if n <= 0 {
@@ -148,6 +161,8 @@ func (s *Store) NoteSend(userID string, n int) error {
 	return s.updateSession(userID, func(item *Session) {
 		item.SentCount += n
 		item.LastSentAt = time.Now()
+		item.BlockReason = ""
+		item.BlockedAt = time.Time{}
 	})
 }
 

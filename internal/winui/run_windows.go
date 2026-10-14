@@ -53,18 +53,21 @@ func run(application *app.App, listen, token string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = srv.Serve(ln) }()
-	go func() { _ = application.Supervise(ctx) }()
 	var book *schedule.Book
 	if application.Catalog != nil {
 		book, err = schedule.Open(application.Catalog.Dir())
 		if err != nil {
 			return err
 		}
+		application.SetOnIncoming(func(msg app.Incoming) {
+			book.AddPhone(msg.Account, msg.UserID, msg.Text)
+		})
 		go book.Loop(ctx, func(ctx context.Context, account, to, text string) error {
 			_, err := application.SendAccount(ctx, account, to, text)
 			return err
 		})
 	}
+	go func() { _ = application.Supervise(ctx) }()
 	defer func() {
 		shutdown, stop := context.WithTimeout(context.Background(), 3*time.Second)
 		defer stop()
@@ -76,34 +79,43 @@ func run(application *app.App, listen, token string) error {
 
 func openWindow(application *app.App, book *schedule.Book, ctx context.Context, addr, token string) error {
 	ui := &desk{
-		app:      application,
-		book:     book,
-		ctx:      ctx,
-		addr:     addr,
-		token:    token,
-		accounts: &textModel{},
-		sessions: &textModel{},
+		app:       application,
+		book:      book,
+		ctx:       ctx,
+		addr:      addr,
+		token:     token,
+		accounts:  &textModel{},
+		sessions:  &textModel{},
+		sendModel: &textModel{},
+	}
+	scheduleOn := true
+	if book != nil {
+		if on, err := book.SchedulerOn(); err == nil {
+			scheduleOn = on
+		}
 	}
 	if err := (MainWindow{
 		AssignTo: &ui.mw,
 		Icon:     appIcon(),
 		Title:    "微信 ClawBot",
 		Font:     Font{Family: "Microsoft YaHei UI", PointSize: 10},
-		MinSize:  Size{Width: 860, Height: 560},
-		Size:     Size{Width: 960, Height: 640},
+		MinSize:  Size{Width: 860, Height: 680},
+		Size:     Size{Width: 980, Height: 760},
 		Layout:   VBox{Margins: Margins{Left: 12, Top: 12, Right: 12, Bottom: 12}},
 		Children: []Widget{
 			Composite{
 				Layout: HBox{MarginsZero: true},
 				Children: []Widget{
-					Label{Text: "扫码、查看会话、发消息。窗口开着就会监听微信，并执行定时任务。"},
+					Label{Text: "窗口开着就会监听微信。勾选「到点执行」后，定时任务才会自动发。"},
 					HSpacer{},
+					CheckBox{AssignTo: &ui.scheduleOn, Text: "到点执行", Checked: scheduleOn, Enabled: book != nil, OnCheckedChanged: ui.onScheduleSwitch},
 					PushButton{Text: "定时任务", OnClicked: ui.tasks},
 					Label{AssignTo: &ui.watch},
 				},
 			},
 			Composite{
-				Layout: HBox{MarginsZero: true},
+				Layout:        HBox{MarginsZero: true},
+				StretchFactor: 3,
 				Children: []Widget{
 					Composite{
 						Layout:    VBox{MarginsZero: true},
@@ -115,15 +127,17 @@ func openWindow(application *app.App, book *schedule.Book, ctx context.Context, 
 								Layout: HBox{MarginsZero: true},
 								Children: []Widget{
 									Label{Text: "微信"},
+									Label{Text: "Ctrl 多选", TextColor: walk.RGB(120, 120, 120)},
 									HSpacer{},
 									PushButton{Text: "添加微信", OnClicked: func() { ui.login("") }},
 								},
 							},
 							ListBox{
-								AssignTo:              &ui.accountList,
-								Model:                 ui.accounts,
-								StretchFactor:         1,
-								OnCurrentIndexChanged: ui.onAccount,
+								AssignTo:                 &ui.accountList,
+								Model:                    ui.accounts,
+								StretchFactor:            1,
+								MultiSelection:           true,
+								OnSelectedIndexesChanged: ui.onAccount,
 							},
 							Composite{
 								Layout: HBox{MarginsZero: true},
@@ -146,7 +160,7 @@ func openWindow(application *app.App, book *schedule.Book, ctx context.Context, 
 							},
 							Label{AssignTo: &ui.detail, Text: "还没有会话。"},
 							Label{Text: "发给谁"},
-							LineEdit{AssignTo: &ui.to, CueBanner: "留空则发给这个微信最近收到消息的用户"},
+							LineEdit{AssignTo: &ui.to, CueBanner: "留空则每个选中的微信发给自己最近的会话"},
 							Label{Text: "内容"},
 							TextEdit{AssignTo: &ui.text, MinSize: Size{Height: 72}},
 							Composite{
@@ -159,6 +173,24 @@ func openWindow(application *app.App, book *schedule.Book, ctx context.Context, 
 						},
 					},
 				},
+			},
+			Label{Text: "发送日志", TextColor: walk.RGB(80, 80, 80)},
+			ListBox{
+				AssignTo:              &ui.sendList,
+				Model:                 ui.sendModel,
+				StretchFactor:         1,
+				MinSize:               Size{Height: 96},
+				OnCurrentIndexChanged: ui.showSend,
+			},
+			TextEdit{
+				AssignTo:      &ui.sendBody,
+				ReadOnly:      true,
+				VScroll:       true,
+				HScroll:       true,
+				StretchFactor: 1,
+				MinSize:       Size{Height: 88},
+				Font:          Font{Family: "Consolas", PointSize: 10},
+				Text:          "还没有记录。在这里发消息、定时任务到点，或对方从手机发来消息之后，会出现在上面。",
 			},
 			Composite{
 				Layout: HBox{MarginsZero: true},
@@ -173,6 +205,7 @@ func openWindow(application *app.App, book *schedule.Book, ctx context.Context, 
 		return err
 	}
 	ui.refresh()
+	ui.refreshSends(true)
 	stop := make(chan struct{})
 	go ui.poll(stop)
 	ui.mw.Run()
@@ -192,6 +225,7 @@ type sessionItem struct {
 	Detail string
 	When   string
 	Status string
+	Last   string
 }
 
 type textModel struct {
@@ -203,28 +237,36 @@ func (m *textModel) ItemCount() int              { return len(m.items) }
 func (m *textModel) Value(index int) interface{} { return m.items[index] }
 
 type desk struct {
-	app          *app.App
-	book         *schedule.Book
-	ctx          context.Context
-	addr         string
-	token        string
-	mw           *walk.MainWindow
-	watch        *walk.Label
-	accountList  *walk.ListBox
-	sessionList  *walk.ListBox
-	sessionTitle *walk.Label
-	detail       *walk.Label
-	to           *walk.LineEdit
-	text         *walk.TextEdit
-	sendBtn      *walk.PushButton
-	notice       *walk.TextEdit
-	apiAddr      *walk.LineEdit
-	accounts     *textModel
-	sessions     *textModel
-	accountRows  []accountItem
-	sessionRows  []sessionItem
-	selected     string
-	suppress     bool
+	app           *app.App
+	book          *schedule.Book
+	ctx           context.Context
+	addr          string
+	token         string
+	mw            *walk.MainWindow
+	watch         *walk.Label
+	accountList   *walk.ListBox
+	sessionList   *walk.ListBox
+	sessionTitle  *walk.Label
+	detail        *walk.Label
+	to            *walk.LineEdit
+	text          *walk.TextEdit
+	sendBtn       *walk.PushButton
+	notice        *walk.TextEdit
+	apiAddr       *walk.LineEdit
+	sendList      *walk.ListBox
+	sendBody      *walk.TextEdit
+	accounts      *textModel
+	sessions      *textModel
+	sendModel     *textModel
+	sendRows      []schedule.RunLog
+	sendHead      string
+	sendQuiet     bool
+	scheduleOn    *walk.CheckBox
+	scheduleQuiet bool
+	accountRows   []accountItem
+	sessionRows   []sessionItem
+	selected      string
+	suppress      bool
 }
 
 func (d *desk) poll(stop <-chan struct{}) {
@@ -240,6 +282,8 @@ func (d *desk) poll(stop <-chan struct{}) {
 					return
 				}
 				d.refresh()
+				d.refreshSends(false)
+				d.syncScheduleSwitch()
 			})
 		}
 	}
@@ -274,49 +318,92 @@ func (d *desk) refresh() {
 		rows = append(rows, row)
 		labels = append(labels, accountLabel(row, len(group.Sessions)))
 	}
+	pickedNames := d.chosenAccounts()
 	d.accountRows = rows
 	if len(watching) == 0 {
 		d.watch.SetText("尚未监听")
 	} else {
 		d.watch.SetText(fmt.Sprintf("正在监听 %d 个微信", len(watching)))
 	}
-	index := 0
-	found := false
+	picked := map[string]bool{}
+	for _, name := range pickedNames {
+		picked[name] = true
+	}
+	if len(picked) == 0 && d.selected != "" {
+		picked[d.selected] = true
+	}
+	var indexes []int
 	for i, row := range rows {
-		if row.Name == d.selected {
-			index = i
-			found = true
-			break
+		if picked[row.Name] {
+			indexes = append(indexes, i)
 		}
 	}
-	if !found && len(rows) > 0 {
-		d.selected = rows[0].Name
+	if len(indexes) == 0 && len(rows) > 0 {
+		indexes = []int{0}
 	}
 	if len(rows) == 0 {
 		d.selected = ""
+	} else if _, ok := picked[d.selected]; !ok {
+		d.selected = rows[indexes[0]].Name
 	}
 	outer := d.suppress
 	d.suppress = true
 	d.accounts.items = labels
 	d.accounts.PublishItemsReset()
-	if len(rows) == 0 {
-		d.accountList.SetCurrentIndex(-1)
-	} else {
-		d.accountList.SetCurrentIndex(index)
-	}
+	d.accountList.SetSelectedIndexes(indexes)
 	d.fillSessions()
 	d.suppress = outer
+}
+
+func (d *desk) chosenAccounts() []string {
+	if d.accountList == nil {
+		if d.selected == "" {
+			return nil
+		}
+		return []string{d.selected}
+	}
+	var names []string
+	seen := map[string]bool{}
+	for _, index := range d.accountList.SelectedIndexes() {
+		if index < 0 || index >= len(d.accountRows) {
+			continue
+		}
+		name := d.accountRows[index].Name
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	if len(names) == 0 && d.selected != "" {
+		return []string{d.selected}
+	}
+	return names
 }
 
 func (d *desk) onAccount() {
 	if d.suppress {
 		return
 	}
-	index := d.accountList.CurrentIndex()
-	if index < 0 || index >= len(d.accountRows) {
+	names := d.chosenAccounts()
+	if len(names) == 0 {
+		d.selected = ""
+		d.fillSessions()
 		return
 	}
-	d.selected = d.accountRows[index].Name
+	focus := ""
+	if index := d.accountList.CurrentIndex(); index >= 0 && index < len(d.accountRows) {
+		focus = d.accountRows[index].Name
+	}
+	if focus == "" {
+		focus = names[0]
+	}
+	if focus == d.selected {
+		d.sessionTitle.SetText(d.sessionHeading(focus, len(names)))
+		d.sendBtn.SetEnabled(true)
+		return
+	}
+	d.selected = focus
 	d.fillSessions()
 }
 
@@ -342,7 +429,7 @@ func (d *desk) fillSessions() {
 		d.sendBtn.SetEnabled(false)
 		return
 	}
-	d.sessionTitle.SetText("用「" + current.Name + "」发消息")
+	d.sessionTitle.SetText(d.sessionHeading(current.Name, len(d.chosenAccounts())))
 	d.sendBtn.SetEnabled(true)
 	grouped, err := d.app.AccountSessions(current.Name)
 	if err != nil {
@@ -360,9 +447,14 @@ func (d *desk) fillSessions() {
 				Detail: view.Detail,
 				When:   formatTime(view.UpdatedAt),
 				Status: sessionMark(view.Status),
+				Last:   view.LastText,
 			}
 			sessions = append(sessions, row)
-			labels = append(labels, row.User+"    "+row.Status)
+			label := row.User + "    " + row.Status
+			if row.Last != "" {
+				label += "    " + preview(row.Last, 36)
+			}
+			labels = append(labels, label)
 		}
 	}
 	prev := d.sessionList.CurrentIndex()
@@ -399,15 +491,38 @@ func (d *desk) showDetail(index int) {
 		return
 	}
 	row := d.sessionRows[index]
-	d.detail.SetText(row.Detail + "    上次收到 " + row.When)
+	text := row.Detail + "    上次收到 " + row.When
+	if row.Last != "" {
+		text += "：" + row.Last
+	}
+	d.detail.SetText(text)
+}
+
+func preview(text string, limit int) string {
+	text = strings.Join(strings.Fields(text), " ")
+	if text == "" || limit <= 0 {
+		return text
+	}
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
+	return string(runes[:limit]) + "…"
+}
+
+func (d *desk) sessionHeading(name string, count int) string {
+	if count > 1 {
+		return fmt.Sprintf("查看「%s」，发送时共 %d 个微信", name, count)
+	}
+	return "用「" + name + "」发消息"
 }
 
 func (d *desk) send() {
-	account := d.selected
+	accounts := d.chosenAccounts()
 	to := strings.TrimSpace(d.to.Text())
 	text := strings.TrimSpace(d.text.Text())
-	if account == "" {
-		d.setNotice("先选择一个微信")
+	if len(accounts) == 0 {
+		d.setNotice("先选择微信，按住 Ctrl 可以多选")
 		return
 	}
 	if text == "" {
@@ -415,22 +530,45 @@ func (d *desk) send() {
 		return
 	}
 	d.sendBtn.SetEnabled(false)
-	d.setNotice("正在发送…")
+	if len(accounts) == 1 {
+		d.setNotice("正在发送…")
+	} else {
+		d.setNotice(fmt.Sprintf("正在由 %d 个微信发送…", len(accounts)))
+	}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		result, err := d.app.SendAccount(ctx, account, to, text)
+		type oneSend struct {
+			account string
+			result  app.SendResult
+			err     error
+		}
+		outcomes := make([]oneSend, 0, len(accounts))
+		for _, account := range accounts {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			result, err := d.app.SendAccount(ctx, account, to, text)
+			cancel()
+			outcomes = append(outcomes, oneSend{account: account, result: result, err: err})
+		}
 		d.mw.Synchronize(func() {
 			if d.mw.IsDisposed() {
 				return
 			}
-			d.sendBtn.SetEnabled(d.selected != "")
-			if err != nil {
-				d.setNotice(err.Error())
-				return
+			d.sendBtn.SetEnabled(len(d.chosenAccounts()) > 0)
+			var notes []string
+			failed := 0
+			for _, item := range outcomes {
+				d.noteLiveSend(item.account, to, text, item.result, item.err)
+				if item.err != nil {
+					failed++
+					notes = append(notes, item.account+" 失败："+headLine(item.err.Error()))
+					continue
+				}
+				notes = append(notes, fmt.Sprintf("%s 已发给 %s", item.result.Account, item.result.To))
 			}
-			d.text.SetText("")
-			d.setNotice(fmt.Sprintf("已由微信 %s 发送给 %s（本次 %d 条）", result.Account, result.To, result.Parts))
+			d.refreshSends(true)
+			if failed == 0 {
+				d.text.SetText("")
+			}
+			d.setNotice(strings.Join(notes, "；"))
 			d.refresh()
 		})
 	}()
@@ -470,6 +608,156 @@ func (d *desk) copyToken() {
 
 func (d *desk) setNotice(text string) {
 	_ = d.notice.SetText(text)
+}
+
+func (d *desk) onScheduleSwitch() {
+	if d.scheduleQuiet || d.book == nil || d.scheduleOn == nil {
+		return
+	}
+	on := d.scheduleOn.Checked()
+	if err := d.book.SetSchedulerOn(on); err != nil {
+		d.setNotice(err.Error())
+		d.syncScheduleSwitch()
+		return
+	}
+	if on {
+		d.setNotice("定时任务已打开，到点会发送")
+		return
+	}
+	d.setNotice("定时任务已关闭。窗口仍在监听，到点不会发送。")
+}
+
+func (d *desk) syncScheduleSwitch() {
+	if d.book == nil || d.scheduleOn == nil {
+		return
+	}
+	on, err := d.book.SchedulerOn()
+	if err != nil || d.scheduleOn.Checked() == on {
+		return
+	}
+	d.scheduleQuiet = true
+	d.scheduleOn.SetChecked(on)
+	d.scheduleQuiet = false
+}
+
+func (d *desk) noteLiveSend(account, to, text string, result app.SendResult, err error) {
+	if d.book == nil {
+		return
+	}
+	entry := schedule.RunLog{
+		Name:    "即时发送",
+		Account: account,
+		To:      to,
+		Live:    true,
+	}
+	if result.Account != "" {
+		entry.Account = result.Account
+	}
+	if result.To != "" {
+		entry.To = result.To
+	}
+	if err != nil {
+		msg := err.Error()
+		entry.Result = "发送失败：" + headLine(msg)
+		entry.Text = msg
+		if text != "" {
+			entry.Text += "\n\n准备发送的内容：\n" + text
+		}
+	} else {
+		parts := result.Parts
+		if parts < 1 {
+			parts = 1
+		}
+		entry.Result = fmt.Sprintf("已发送（%d 条）", parts)
+		entry.Text = strings.TrimSpace(result.Trace)
+		if text != "" {
+			if entry.Text != "" {
+				entry.Text += "\n\n"
+			}
+			entry.Text += text
+		}
+	}
+	d.book.AddLog(entry)
+}
+
+func (d *desk) refreshSends(follow bool) {
+	if d.book == nil || d.sendList == nil || d.sendModel == nil || d.sendBody == nil {
+		return
+	}
+	logs, err := d.book.Logs()
+	if err != nil {
+		if follow {
+			_ = d.sendBody.SetText(err.Error())
+		}
+		return
+	}
+	head := ""
+	if len(logs) > 0 {
+		head = sendKey(logs[0])
+	}
+	selected := ""
+	if !follow {
+		if head == d.sendHead && len(logs) == len(d.sendRows) {
+			return
+		}
+		if i := d.sendList.CurrentIndex(); i >= 0 && i < len(d.sendRows) {
+			selected = sendKey(d.sendRows[i])
+		}
+	}
+	d.sendRows = logs
+	d.sendHead = head
+	labels := make([]string, len(logs))
+	for i, item := range logs {
+		labels[i] = item.Line()
+	}
+	d.sendModel.items = labels
+	d.sendQuiet = true
+	d.sendModel.PublishItemsReset()
+	d.sendQuiet = false
+	if len(logs) == 0 {
+		_ = d.sendList.SetCurrentIndex(-1)
+		_ = d.sendBody.SetText("还没有记录。在这里发消息、定时任务到点，或对方从手机发来消息之后，会出现在上面。")
+		return
+	}
+	index := 0
+	if selected != "" {
+		for i, item := range logs {
+			if sendKey(item) == selected {
+				index = i
+				break
+			}
+		}
+	}
+	d.sendQuiet = true
+	_ = d.sendList.SetCurrentIndex(index)
+	d.sendQuiet = false
+	d.showSend()
+}
+
+func (d *desk) showSend() {
+	if d.sendQuiet || d.sendBody == nil || d.sendList == nil {
+		return
+	}
+	index := d.sendList.CurrentIndex()
+	if index < 0 || index >= len(d.sendRows) {
+		return
+	}
+	_ = d.sendBody.SetText(d.sendRows[index].Detail())
+}
+
+func sendKey(entry schedule.RunLog) string {
+	return entry.Time.Format(time.RFC3339Nano) + "\n" + entry.Name + "\n" + entry.To + "\n" + entry.Result
+}
+
+func headLine(text string) string {
+	text = strings.TrimSpace(text)
+	if i := strings.IndexAny(text, "\r\n"); i >= 0 {
+		text = strings.TrimSpace(text[:i])
+	}
+	if text == "" {
+		return "未知错误"
+	}
+	return text
 }
 
 func (d *desk) login(preset string) {

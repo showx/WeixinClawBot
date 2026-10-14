@@ -112,6 +112,35 @@ func TestSaveKeepsNewTaskFromFiring(t *testing.T) {
 	}
 }
 
+func TestRunSendsToEveryAccount(t *testing.T) {
+	book := openTestBook(t)
+	saved, err := book.Save(Task{
+		Name: "早报", Account: "工作", Accounts: []string{"工作", "生活"},
+		Enabled: true, Kind: KindText, Body: "你好",
+		Mode: ModeDaily, At: "08:30",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if label := saved.AccountLabel(); label != "工作、生活" {
+		t.Fatalf("展示: %s", label)
+	}
+	var got []string
+	result, err := book.RunOne(context.Background(), saved.ID, func(_ context.Context, account, to, text string) error {
+		got = append(got, account+"|"+to+"|"+text)
+		if account == "生活" {
+			return errors.New("拒收")
+		}
+		return nil
+	})
+	if err == nil || !strings.Contains(result, "工作 已发送") || !strings.Contains(result, "生活 失败") {
+		t.Fatalf("应继续发给其余微信: result=%s err=%v", result, err)
+	}
+	if len(got) != 2 || got[0] != "工作||你好" || got[1] != "生活||你好" {
+		t.Fatalf("发送对象: %#v", got)
+	}
+}
+
 func TestValidate(t *testing.T) {
 	ok := Task{Name: "早报", Account: "工作", Kind: KindText, Body: "你好", Mode: ModeDaily, At: "08:30"}
 	if err := ok.Validate(); err != nil {
@@ -165,6 +194,54 @@ func TestTickSendsOnceAndRecordsFailure(t *testing.T) {
 	}
 	if got.Due(time.Now()) {
 		t.Fatal("记下失败后，今天这一档不应再到期")
+	}
+}
+
+func TestPausedSkipsWithoutSending(t *testing.T) {
+	book := openTestBook(t)
+	on, err := book.SchedulerOn()
+	if err != nil || !on {
+		t.Fatalf("默认应到点执行: %v %v", on, err)
+	}
+	saved, err := book.Save(Task{
+		Name: "日报", Account: "工作", Enabled: true,
+		Kind: KindText, Body: "结果", Mode: ModeDaily, At: "00:00",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := book.Mark(saved.ID, time.Now().AddDate(0, 0, -1), ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := book.SetSchedulerOn(false); err != nil {
+		t.Fatal(err)
+	}
+	on, err = book.SchedulerOn()
+	if err != nil || on {
+		t.Fatalf("关闭后不应再自动执行: %v %v", on, err)
+	}
+	calls := 0
+	send := func(context.Context, string, string, string) error {
+		calls++
+		return nil
+	}
+	book.tick(context.Background(), send)
+	if calls != 0 {
+		t.Fatalf("关闭后不应发送，发送了 %d 次", calls)
+	}
+	got, ok, err := book.Get(saved.ID)
+	if err != nil || !ok {
+		t.Fatal(err, ok)
+	}
+	if got.Due(time.Now()) || !strings.Contains(got.LastResult, "已暂停") {
+		t.Fatalf("暂停应跳过今天这一档: %+v", got)
+	}
+	if err := book.SetSchedulerOn(true); err != nil {
+		t.Fatal(err)
+	}
+	book.tick(context.Background(), send)
+	if calls != 0 {
+		t.Fatalf("重新打开后，今天已跳过的任务不应补发，发送了 %d 次", calls)
 	}
 }
 

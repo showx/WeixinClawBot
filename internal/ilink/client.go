@@ -96,6 +96,7 @@ type Inbound struct {
 	ToUserID     string
 	MessageType  int
 	ContextToken string
+	Text         string
 }
 
 type Updates struct {
@@ -191,10 +192,12 @@ func (c *Client) GetUpdates(ctx context.Context, creds Credentials, cursor strin
 		Cursor   string `json:"get_updates_buf"`
 		PollMS   int64  `json:"longpolling_timeout_ms"`
 		Messages []struct {
-			FromUserID   string `json:"from_user_id"`
-			ToUserID     string `json:"to_user_id"`
-			MessageType  int    `json:"message_type"`
-			ContextToken string `json:"context_token"`
+			FromUserID   string    `json:"from_user_id"`
+			ToUserID     string    `json:"to_user_id"`
+			MessageType  int       `json:"message_type"`
+			ContextToken string    `json:"context_token"`
+			Text         string    `json:"text"`
+			ItemList     []rawItem `json:"item_list"`
 		} `json:"msgs"`
 	}
 	err := c.post(ctx, creds.BaseURL, "ilink/bot/getupdates", creds.BotToken, map[string]any{
@@ -215,11 +218,16 @@ func (c *Client) GetUpdates(ctx context.Context, creds Credentials, cursor strin
 		updates.Cursor = cursor
 	}
 	for _, msg := range out.Messages {
+		text := inboundText(msg.ItemList)
+		if text == "" {
+			text = strings.TrimSpace(msg.Text)
+		}
 		updates.Messages = append(updates.Messages, Inbound{
 			FromUserID:   msg.FromUserID,
 			ToUserID:     msg.ToUserID,
 			MessageType:  msg.MessageType,
 			ContextToken: msg.ContextToken,
+			Text:         text,
 		})
 	}
 	return updates, nil
@@ -304,6 +312,50 @@ func PeerUserID(msg Inbound, botID string) string {
 
 func isWechatUser(id string) bool {
 	return strings.HasSuffix(id, "@im.wechat")
+}
+
+type rawItem struct {
+	Type     int    `json:"type"`
+	Text     string `json:"text"`
+	TextItem struct {
+		Text string `json:"text"`
+	} `json:"text_item"`
+	ImageItem json.RawMessage `json:"image_item"`
+	VoiceItem json.RawMessage `json:"voice_item"`
+	VideoItem json.RawMessage `json:"video_item"`
+	FileItem  json.RawMessage `json:"file_item"`
+}
+
+func inboundText(items []rawItem) string {
+	var lines []string
+	for _, item := range items {
+		if text := strings.TrimSpace(item.TextItem.Text); text != "" {
+			lines = append(lines, text)
+			continue
+		}
+		if text := strings.TrimSpace(item.Text); text != "" {
+			lines = append(lines, text)
+			continue
+		}
+		switch {
+		case hasItem(item.ImageItem) || item.Type == 2:
+			lines = append(lines, "［图片］")
+		case hasItem(item.VoiceItem) || item.Type == 3:
+			lines = append(lines, "［语音］")
+		case hasItem(item.VideoItem) || item.Type == 4:
+			lines = append(lines, "［视频］")
+		case hasItem(item.FileItem) || item.Type == 5:
+			lines = append(lines, "［文件］")
+		case item.Type != 0 && item.Type != 1:
+			lines = append(lines, "［其他消息］")
+		}
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func hasItem(raw json.RawMessage) bool {
+	text := strings.TrimSpace(string(raw))
+	return text != "" && text != "null"
 }
 
 // SplitText 按 Unicode 字符切分，优先在换行处切开。

@@ -22,10 +22,19 @@ type Book struct {
 	running    map[string]bool
 	runCommand func(ctx context.Context, command string) (string, error)
 	fetchPage  func(ctx context.Context, rawURL string) (string, error)
+	browse     func(ctx context.Context, body string) (string, error)
 }
 
 type file struct {
-	Tasks []Task `json:"tasks"`
+	Tasks  []Task `json:"tasks"`
+	Paused bool   `json:"paused,omitempty"`
+}
+
+func (b *Book) Dir() string {
+	if b == nil || b.path == "" {
+		return ""
+	}
+	return filepath.Dir(b.path)
 }
 
 func Open(dir string) (*Book, error) {
@@ -36,6 +45,35 @@ func Open(dir string) (*Book, error) {
 		path:    filepath.Join(dir, "schedules.json"),
 		running: map[string]bool{},
 	}, nil
+}
+
+// SchedulerOn 表示到点会不会自动执行。关掉后任务都还在，窗口仍可监听和手动发送。
+func (b *Book) SchedulerOn() (bool, error) {
+	if b == nil {
+		return false, nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	stored, err := b.read()
+	if err != nil {
+		return false, err
+	}
+	return !stored.Paused, nil
+}
+
+// SetSchedulerOn 打开或关闭全部定时任务的自动执行。
+func (b *Book) SetSchedulerOn(on bool) error {
+	if b == nil {
+		return errors.New("定时任务不可用")
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	stored, err := b.read()
+	if err != nil {
+		return err
+	}
+	stored.Paused = !on
+	return b.write(stored)
 }
 
 func (b *Book) List() ([]Task, error) {

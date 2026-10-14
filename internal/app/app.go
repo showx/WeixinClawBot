@@ -27,6 +27,7 @@ type SendResult struct {
 	To        string
 	Parts     int
 	SentSince int
+	Trace     string
 }
 
 // App 负责扫码登录、缓存 context_token，以及主动发文本。
@@ -42,6 +43,53 @@ type App struct {
 	desk     *deskLogin
 	watchMu  sync.Mutex
 	watching []string
+
+	incomingOnce sync.Once
+	incoming     *incomingBox
+}
+
+// Incoming 是对方从手机发给 ClawBot 的一条消息。
+type Incoming struct {
+	Account string
+	UserID  string
+	Text    string
+}
+
+type incomingBox struct {
+	mu sync.Mutex
+	fn func(Incoming)
+}
+
+// SetOnIncoming 在收到手机发来的消息时回调。监听开始前设置即可，之后新登录的微信也会用同一份。
+func (a *App) SetOnIncoming(fn func(Incoming)) {
+	if a == nil {
+		return
+	}
+	box := a.incomingHook()
+	box.mu.Lock()
+	box.fn = fn
+	box.mu.Unlock()
+}
+
+func (a *App) incomingHook() *incomingBox {
+	a.incomingOnce.Do(func() {
+		a.incoming = &incomingBox{}
+	})
+	return a.incoming
+}
+
+func (a *App) emitIncoming(userID, text string) {
+	text = strings.TrimSpace(text)
+	if a == nil || a.incoming == nil || text == "" {
+		return
+	}
+	a.incoming.mu.Lock()
+	fn := a.incoming.fn
+	a.incoming.mu.Unlock()
+	if fn == nil {
+		return
+	}
+	fn(Incoming{Account: a.Name, UserID: userID, Text: text})
 }
 
 func (a *App) logger() *log.Logger {
@@ -252,11 +300,12 @@ func (a *App) Watch(ctx context.Context) error {
 			hold = updates.PollTimeout
 		}
 		for _, msg := range updates.Messages {
-			if msg.ContextToken == "" {
-				continue
-			}
 			userID := ilink.PeerUserID(msg, creds.BotID)
-			if userID == "" {
+			text := strings.TrimSpace(msg.Text)
+			if msg.ContextToken == "" || userID == "" {
+				if text != "" {
+					a.emitIncoming(userID, text)
+				}
 				continue
 			}
 			prev, ok, err := a.Store.Session(userID)
@@ -266,8 +315,18 @@ func (a *App) Watch(ctx context.Context) error {
 			if err := a.Store.UpsertSession(userID, msg.ContextToken, time.Now()); err != nil {
 				return err
 			}
+			if text != "" {
+				if noteErr := a.Store.NoteInbound(userID, text); noteErr != nil {
+					a.logf("记下手机消息失败: %v", noteErr)
+				}
+				a.emitIncoming(userID, text)
+			}
 			if ok && prev.BlockReason != "" {
 				a.logf("对方发来新消息，已重新开放发送: %s", userID)
+				continue
+			}
+			if text != "" {
+				a.logf("收到手机消息 %s：%s", userID, text)
 				continue
 			}
 			a.logf("已刷新可发送会话: %s", userID)
@@ -291,50 +350,106 @@ func (a *App) Send(ctx context.Context, to, text string) (SendResult, error) {
 	if err != nil {
 		return SendResult{}, err
 	}
-	if err := blockedError(session); err != nil {
-		return SendResult{}, err
-	}
+	steps := []string{sessionTrace(session, time.Now())}
 	sent, err := a.client().SendText(ctx, toIlink(creds), session.UserID, session.ContextToken, text)
+	steps = append(steps, "已向微信提交发送。")
 	if sent > 0 {
 		if noteErr := a.Store.NoteSend(session.UserID, sent); noteErr != nil {
 			if err != nil {
-				return SendResult{To: session.UserID, Parts: sent}, fmt.Errorf("%v；记录发送次数失败: %w", err, noteErr)
+				return SendResult{To: session.UserID, Parts: sent}, traceErr(err, append(steps, "记录发送次数失败："+noteErr.Error()))
 			}
 			return SendResult{}, noteErr
 		}
 	}
 	if err != nil {
+		steps = append(steps, wechatTrace(err))
 		if kind, ok := ilink.RejectKind(err); ok {
 			reason := store.BlockExpired
 			userErr := ErrTokenRejected
+			next := "微信拒绝了当前会话令牌。下次仍会用这个令牌再试；如果微信继续拒绝，需要对方再给 ClawBot 发一条消息。窗口或 serve 开着时，这条新消息会换成新令牌。"
 			if kind == ilink.RejectRateLimited {
 				reason = store.BlockRateLimited
 				userErr = ErrRateLimited
+				next = "微信限制了继续发送。下次仍会再试；如果继续被拒，需要对方再给 ClawBot 发一条消息。"
 			}
 			if noteErr := a.Store.NoteBlocked(session.UserID, reason); noteErr != nil {
-				return SendResult{To: session.UserID, Parts: sent}, fmt.Errorf("%v；记录微信拒绝失败: %w", userErr, noteErr)
+				return SendResult{To: session.UserID, Parts: sent}, traceErr(userErr, append(steps, "记下拒绝失败："+noteErr.Error()))
 			}
-			return SendResult{To: session.UserID, Parts: sent}, userErr
+			return SendResult{To: session.UserID, Parts: sent}, traceErr(userErr, append(steps, next))
 		}
-		return SendResult{To: session.UserID, Parts: sent}, err
+		return SendResult{To: session.UserID, Parts: sent}, traceErr(err, steps)
 	}
 	updated, _, _ := a.Store.Session(session.UserID)
-	return SendResult{To: session.UserID, Parts: sent, SentSince: updated.SentCount}, nil
+	steps = append(steps, fmt.Sprintf("微信已接受，本次 %d 条，此后累计 %d 条。", sent, updated.SentCount))
+	return SendResult{To: session.UserID, Parts: sent, SentSince: updated.SentCount, Trace: strings.Join(steps, "\n")}, nil
+}
+
+func sessionTrace(session store.Session, now time.Time) string {
+	when := "某次"
+	if !session.UpdatedAt.IsZero() {
+		when = ago(now.Sub(session.UpdatedAt)) + "（" + session.UpdatedAt.Format("01-02 15:04") + "）"
+	}
+	line := fmt.Sprintf("选用会话 %s。令牌来自对方%s发给 ClawBot 的消息，此后微信已接受 %d 条。", session.UserID, when, session.SentCount)
+	if session.BlockReason == "" || session.BlockedAt.IsZero() {
+		return line
+	}
+	why := "拒绝了会话令牌"
+	if session.BlockReason == store.BlockRateLimited {
+		why = "限制了继续发送"
+	}
+	return line + fmt.Sprintf(" 上次 %s 微信%s，这次仍会再请求微信。", session.BlockedAt.Format("01-02 15:04"), why)
+}
+
+func wechatTrace(err error) string {
+	var apiErr *ilink.APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.Message != "" {
+			return fmt.Sprintf("微信返回 %d：%s。", apiErr.Code, apiErr.Message)
+		}
+		return fmt.Sprintf("微信返回 %d，没有附加说明。", apiErr.Code)
+	}
+	return "请求没有完成：" + err.Error()
+}
+
+func ago(d time.Duration) string {
+	if d < time.Minute {
+		return "刚刚"
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%d 分钟前", int(d.Minutes()))
+	}
+	if d < 48*time.Hour {
+		return fmt.Sprintf("%d 小时前", int(d.Hours()))
+	}
+	return fmt.Sprintf("%d 天前", int(d.Hours()/24))
+}
+
+type sendError struct {
+	err   error
+	trace string
+}
+
+func (e *sendError) Error() string { return e.trace }
+
+func (e *sendError) Unwrap() error { return e.err }
+
+func traceErr(err error, steps []string) error {
+	var b strings.Builder
+	if err != nil {
+		b.WriteString(err.Error())
+	}
+	for _, step := range steps {
+		if strings.TrimSpace(step) == "" {
+			continue
+		}
+		b.WriteString("\n")
+		b.WriteString(step)
+	}
+	return &sendError{err: err, trace: b.String()}
 }
 
 func (a *App) Sessions() ([]store.Session, error) {
 	return a.Store.ListSessions()
-}
-
-func blockedError(session store.Session) error {
-	switch session.BlockReason {
-	case store.BlockExpired:
-		return ErrTokenRejected
-	case store.BlockRateLimited:
-		return ErrRateLimited
-	default:
-		return nil
-	}
 }
 
 func (a *App) pickSession(to string) (store.Session, error) {

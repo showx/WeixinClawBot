@@ -244,6 +244,9 @@ func serveLoop(application *app.App, listen, token string, watch func(context.Co
 		if err != nil {
 			log.Printf("定时任务未启动: %v", err)
 		} else {
+			application.SetOnIncoming(func(msg app.Incoming) {
+				book.AddPhone(msg.Account, msg.UserID, msg.Text)
+			})
 			go book.Loop(ctx, func(ctx context.Context, account, to, text string) error {
 				_, err := application.SendAccount(ctx, account, to, text)
 				return err
