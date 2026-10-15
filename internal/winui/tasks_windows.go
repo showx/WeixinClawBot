@@ -70,6 +70,7 @@ func (d *desk) tasks() {
 				Children: []Widget{
 					PushButton{Text: "新建", OnClicked: func() { box.create() }},
 					PushButton{Text: "编辑", OnClicked: func() { box.edit() }},
+					PushButton{Text: "复制", OnClicked: func() { box.duplicate() }},
 					PushButton{Text: "删除", OnClicked: func() { box.remove() }},
 					PushButton{AssignTo: &runBtn, Text: "现在运行", OnClicked: func() { box.runNow() }},
 					PushButton{Text: "日志", OnClicked: func() { box.showLogs() }},
@@ -239,6 +240,17 @@ func (b *taskBox) create() {
 	}
 }
 
+func (b *taskBox) duplicate() {
+	current, ok := b.selected()
+	if !ok {
+		b.detail.SetText("先选一条任务。")
+		return
+	}
+	if editTask(b.dlg, b.owner.book, b.accountNames(current.Account), current.Copy()) {
+		b.reload()
+	}
+}
+
 func (b *taskBox) edit() {
 	current, ok := b.selected()
 	if !ok {
@@ -313,9 +325,9 @@ func (b *taskBox) showLogs() {
 		return
 	}
 	var dlg *walk.Dialog
-	var list *walk.ListBox
+	var list *walk.TableView
 	var body *walk.TextEdit
-	model := &textModel{}
+	model := &logTable{}
 	var entries []schedule.RunLog
 	show := func() {
 		if body == nil || list == nil {
@@ -334,18 +346,14 @@ func (b *taskBox) showLogs() {
 		}
 		if err != nil {
 			entries = nil
-			model.items = nil
-			model.PublishItemsReset()
+			model.rows = nil
+			model.PublishRowsReset()
 			_ = body.SetText(err.Error())
 			return
 		}
 		entries = logs
-		labels := make([]string, len(logs))
-		for i, item := range logs {
-			labels[i] = item.Line()
-		}
-		model.items = labels
-		model.PublishItemsReset()
+		model.rows = logs
+		model.PublishRowsReset()
 		if len(logs) == 0 {
 			_ = body.SetText("还没有记录。在主窗口发送、定时任务到点，或对方从手机发来消息之后，会记在这里。")
 			return
@@ -361,14 +369,26 @@ func (b *taskBox) showLogs() {
 		MinSize:  Size{Width: 720, Height: 520},
 		Layout:   VBox{Margins: Margins{Left: 14, Top: 12, Right: 14, Bottom: 12}, Spacing: 8},
 		Children: []Widget{
-			Label{Text: "和主窗口下方是同一份记录，包括手机发来的消息、即时发送和定时任务。", TextColor: walk.RGB(110, 110, 110)},
-			ListBox{
-				AssignTo:              &list,
-				Model:                 model,
-				MinSize:               Size{Height: 180},
-				OnCurrentIndexChanged: show,
+			Label{Text: "和主窗口下方是同一份记录，包括手机发来的消息、即时发送和定时任务。点一行，下面看全文。", TextColor: walk.RGB(110, 110, 110)},
+			TableView{
+				AssignTo:                 &list,
+				Model:                    model,
+				AlternatingRowBG:         true,
+				LastColumnStretched:      true,
+				NotSortableByHeaderClick: true,
+				ColumnsSizable:           true,
+				MinSize:                  Size{Height: 180},
+				Font:                     Font{Family: "Microsoft YaHei UI", PointSize: 9},
+				OnCurrentIndexChanged:    show,
+				Columns: []TableViewColumn{
+					{Title: "时间", Width: 108},
+					{Title: "来源", Width: 52},
+					{Title: "名称", Width: 160},
+					{Title: "发给", Width: 140},
+					{Title: "结果", Width: 220},
+				},
 			},
-			TextEdit{AssignTo: &body, ReadOnly: true, VScroll: true, HScroll: true, StretchFactor: 1, Font: Font{Family: "Consolas", PointSize: 10}},
+			TextEdit{AssignTo: &body, ReadOnly: true, VScroll: true, HScroll: true, StretchFactor: 1, Font: Font{Family: "Microsoft YaHei UI", PointSize: 10}},
 			Composite{
 				Layout: HBox{MarginsZero: true},
 				Children: []Widget{
@@ -382,6 +402,9 @@ func (b *taskBox) showLogs() {
 	if err != nil {
 		walk.MsgBox(b.dlg, "定时任务日志", err.Error(), walk.MsgBoxIconError)
 		return
+	}
+	if list != nil {
+		list.SetGridlines(true)
 	}
 	reload()
 	dlg.Run()
@@ -417,14 +440,15 @@ func editTask(owner walk.Form, book *schedule.Book, accounts []string, current s
 	var accountBox *walk.ListBox
 	var modeBox, kindBox *walk.ComboBox
 	var body *walk.TextEdit
-	var enabled *walk.CheckBox
+	var enabled, showTime, showName *walk.CheckBox
+	var prefixBox *walk.LineEdit
 	var hint, errLabel, atLabel, everyLabel, apiStatus *walk.Label
 	var apiPanel *walk.Composite
 	var method *walk.ComboBox
 	var urlBox *walk.LineEdit
 	var apiBody, response *walk.TextEdit
 	var choices *walk.ListBox
-	var paramScroll, headerScroll, fieldScroll *walk.ScrollView
+	var paramScroll, headerScroll, fieldScroll *walk.Composite
 	var sendBtn *walk.PushButton
 	studio := &apiStudio{syncing: true}
 	choiceModel := &textModel{}
@@ -432,6 +456,9 @@ func editTask(owner walk.Form, book *schedule.Book, accounts []string, current s
 	title := "编辑定时任务"
 	if current.ID == "" {
 		title = "新建定时任务"
+		if strings.TrimSpace(current.Name) != "" {
+			title = "复制定时任务"
+		}
 	}
 	everyText := "60"
 	if current.EveryMinutes > 0 {
@@ -509,7 +536,7 @@ func editTask(owner walk.Form, book *schedule.Book, accounts []string, current s
 								Title:  "参数",
 								Layout: VBox{Margins: Margins{Left: 8, Top: 8, Right: 8, Bottom: 8}, Spacing: 6},
 								Children: []Widget{
-									ScrollView{AssignTo: &paramScroll, Layout: VBox{MarginsZero: true, Spacing: 4, Alignment: AlignHNearVNear}, StretchFactor: 1},
+									Composite{AssignTo: &paramScroll, Layout: VBox{MarginsZero: true, Spacing: 4, Alignment: AlignHNearVNear}},
 									kvAddButton("添加参数", func() { studio.params.add(schedule.APIRow{Enabled: true}) }),
 								},
 							},
@@ -517,7 +544,7 @@ func editTask(owner walk.Form, book *schedule.Book, accounts []string, current s
 								Title:  "请求头",
 								Layout: VBox{Margins: Margins{Left: 8, Top: 8, Right: 8, Bottom: 8}, Spacing: 6},
 								Children: []Widget{
-									ScrollView{AssignTo: &headerScroll, Layout: VBox{MarginsZero: true, Spacing: 4, Alignment: AlignHNearVNear}, StretchFactor: 1},
+									Composite{AssignTo: &headerScroll, Layout: VBox{MarginsZero: true, Spacing: 4, Alignment: AlignHNearVNear}},
 									kvAddButton("添加请求头", func() { studio.headers.add(schedule.APIRow{Enabled: true}) }),
 								},
 							},
@@ -533,10 +560,17 @@ func editTask(owner walk.Form, book *schedule.Book, accounts []string, current s
 								Title:  "字段",
 								Layout: VBox{Margins: Margins{Left: 8, Top: 8, Right: 8, Bottom: 8}, Spacing: 6},
 								Children: []Widget{
-									ScrollView{AssignTo: &fieldScroll, Layout: VBox{MarginsZero: true, Spacing: 4, Alignment: AlignHNearVNear}, StretchFactor: 1, MinSize: Size{Height: 72}},
-									kvAddButton("添加字段", func() { studio.fields.add(schedule.APIRow{Enabled: true}) }),
+									Composite{AssignTo: &fieldScroll, Layout: VBox{MarginsZero: true, Spacing: 4, Alignment: AlignHNearVNear}},
+									Composite{
+										Layout: HBox{MarginsZero: true, Spacing: 8},
+										Children: []Widget{
+											PushButton{Text: "添加字段", OnClicked: func() { studio.addField() }},
+											Label{Text: "单位接在后面：data.list.*.amount元；分先换算：data.list.*.cost/100元", TextColor: walk.RGB(110, 110, 110)},
+											HSpacer{},
+										},
+									},
 									Label{Text: "发送后可从返回里加入", TextColor: walk.RGB(110, 110, 110)},
-									ListBox{AssignTo: &choices, Model: choiceModel, MultiSelection: true, MinSize: Size{Height: 64}},
+									ListBox{AssignTo: &choices, Model: choiceModel, MultiSelection: true, MinSize: Size{Height: 72}, MaxSize: Size{Height: 72}},
 									Composite{
 										Layout: HBox{MarginsZero: true, Spacing: 8},
 										Children: []Widget{
@@ -558,6 +592,16 @@ func editTask(owner walk.Form, book *schedule.Book, accounts []string, current s
 						},
 					},
 					TextEdit{AssignTo: &response, ReadOnly: true, VScroll: true, HScroll: true, StretchFactor: 1, MinSize: Size{Height: 120}, Font: Font{Family: "Consolas", PointSize: 10}},
+				},
+			},
+			Composite{
+				Layout: HBox{MarginsZero: true, Spacing: 8},
+				Children: []Widget{
+					Label{Text: "附带"},
+					CheckBox{AssignTo: &showTime, Text: "发送时间", Checked: current.ShowTime},
+					CheckBox{AssignTo: &showName, Text: "任务名称", Checked: current.ShowName},
+					Label{Text: "附言"},
+					LineEdit{AssignTo: &prefixBox, Text: current.Prefix, CueBanner: "可选，写在正文最前面", StretchFactor: 1},
 				},
 			},
 			CheckBox{AssignTo: &enabled, Text: "启用", Checked: current.Enabled},
@@ -592,6 +636,10 @@ func editTask(owner walk.Form, book *schedule.Book, accounts []string, current s
 	editor.kind = kindBox
 	editor.body = body
 	editor.enabled = enabled
+	editor.showTime = showTime
+	editor.showName = showName
+	editor.prefix = prefixBox
+	studio.preface = editor.preface
 	editor.hint = hint
 	editor.errLabel = errLabel
 	editor.atLabel = atLabel
@@ -649,6 +697,9 @@ type taskEditor struct {
 	kind       *walk.ComboBox
 	body       *walk.TextEdit
 	enabled    *walk.CheckBox
+	showTime   *walk.CheckBox
+	showName   *walk.CheckBox
+	prefix     *walk.LineEdit
 	hint       *walk.Label
 	errLabel   *walk.Label
 	atLabel    *walk.Label
@@ -656,6 +707,23 @@ type taskEditor struct {
 	apiPanel   *walk.Composite
 	api        *apiStudio
 	apiLoaded  bool
+}
+
+func (e *taskEditor) preface() string {
+	if e == nil {
+		return ""
+	}
+	name := ""
+	if e.name != nil {
+		name = e.name.Text()
+	}
+	showTime := e.showTime != nil && e.showTime.Checked()
+	showName := e.showName != nil && e.showName.Checked()
+	prefix := ""
+	if e.prefix != nil {
+		prefix = e.prefix.Text()
+	}
+	return schedule.MessagePreface(name, showTime, showName, prefix, time.Now())
 }
 
 func (e *taskEditor) applyMode() {
@@ -676,7 +744,7 @@ func (e *taskEditor) applyKind() {
 	api := e.kind.CurrentIndex() == 3
 	e.showAPI(api)
 	if api {
-		e.hint.SetText("不勾选字段时，把返回的 JSON 直接发给微信。勾选后只发选中的路径。{today}、{yesterday} 换成 20261014 这种；{today-yyyy-mm-dd}、{yesterday-yyyy-mm-dd} 换成 2026-10-14 这种。")
+		e.hint.SetText("不勾选字段时，把返回的 JSON 直接发给微信。勾选后只发选中的路径。同一名单的几列会排成一行。单位直接接在字段后面，例如 data.list.*.amount元。金额如果是分，先写 /100 再写单位，例如 data.list.*.cost/100元；要乘以某个数就写成 *100。{today}、{yesterday} 换成 20261014 这种；{today-yyyy-mm-dd}、{yesterday-yyyy-mm-dd} 换成 2026-10-14 这种。")
 		return
 	}
 	switch e.kind.CurrentIndex() {
@@ -703,6 +771,9 @@ func (e *taskEditor) save() {
 	task.Name = e.name.Text()
 	task.To = e.to.Text()
 	task.Enabled = e.enabled.Checked()
+	task.ShowTime = e.showTime.Checked()
+	task.ShowName = e.showName.Checked()
+	task.Prefix = strings.TrimSpace(e.prefix.Text())
 	if e.kind.CurrentIndex() == 3 {
 		if e.api == nil {
 			e.errLabel.SetText("请求还没有准备好")

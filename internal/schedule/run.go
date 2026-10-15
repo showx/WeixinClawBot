@@ -105,6 +105,12 @@ func (b *Book) run(ctx context.Context, task Task, send SendFunc, manual bool) (
 		return "", ctx.Err()
 	}
 	if shouldSend {
+		text = fresh.Decorate(text, time.Now())
+		var cut bool
+		text, cut = truncateRunes(text, sendRuneLimit)
+		if cut && !strings.Contains(result, "截断") {
+			result += "（附带内容后已截断）"
+		}
 		accounts := fresh.AccountNames()
 		if len(accounts) <= 1 {
 			account := fresh.Account
@@ -163,7 +169,7 @@ func (b *Book) run(ctx context.Context, task Task, send SendFunc, manual bool) (
 	}
 	logged := fresh
 	logged.Account = fresh.AccountLabel()
-	b.recordRun(logged, when, result, text, manual)
+	b.recordRun(logged, when, result, withAPICurl(fresh, text), manual)
 	if strings.Contains(result, "失败") {
 		log.Printf("定时任务 %s：%s", fresh.Name, result)
 	}
@@ -174,6 +180,20 @@ func (b *Book) run(ctx context.Context, task Task, send SendFunc, manual bool) (
 		return result, err
 	}
 	return result, nil
+}
+
+func withAPICurl(task Task, text string) string {
+	if task.Kind != KindAPI {
+		return text
+	}
+	curl, err := APICurl(task.Body)
+	if err != nil || strings.TrimSpace(curl) == "" {
+		return text
+	}
+	if strings.TrimSpace(text) == "" {
+		return "curl：\n" + curl
+	}
+	return "curl：\n" + curl + "\n\n" + text
 }
 
 func (b *Book) noteCrash(rec any) {

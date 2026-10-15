@@ -2,6 +2,7 @@ package schedule
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -112,6 +113,74 @@ func TestAPITaskSendsFields(t *testing.T) {
 	}
 	if got != "income: 100" || !strings.Contains(result, "已发送") {
 		t.Fatalf("result=%s body=%s", result, got)
+	}
+}
+
+func TestScaleFenToYuan(t *testing.T) {
+	field, err := parseAPIFieldLine("消耗 = data.list.*.cost/100")
+	if err != nil || field.Path != "data.list.*.cost" || field.Op != '/' || field.Factor != 100 || field.Spec() != "data.list.*.cost/100" {
+		t.Fatalf("换算没认出来: %+v %v", field, err)
+	}
+	payload := map[string]any{
+		"data": map[string]any{
+			"list": []any{
+				map[string]any{
+					"game_name": "测试",
+					"cost":      json.Number("357267"),
+					"revenue":   json.Number("15982"),
+				},
+			},
+		},
+	}
+	got := renderFields([]apiField{
+		{Label: "游戏", Path: "data.list.*.game_name"},
+		field,
+		{Label: "收入", Path: "data.list.*.revenue", Op: '/', Factor: 100},
+	}, payload)
+	want := "游戏: 测试  消耗: 3572.67  收入: 159.82"
+	if got != want {
+		t.Fatalf("分没有换成元:\n%s", got)
+	}
+	dollar, err := parseAPIFieldLine("消耗 = data.list.*.cost/100美元")
+	if err != nil || dollar.Unit != "美元" || dollar.Spec() != "data.list.*.cost/100美元" {
+		t.Fatalf("单位没认出来: %+v %v", dollar, err)
+	}
+	got = renderFields([]apiField{dollar}, payload)
+	if got != "消耗: 3572.67美元" {
+		t.Fatalf("单位没跟上:\n%s", got)
+	}
+	yuan, err := parseAPIFieldLine("金额 = data.list.*.amount元")
+	if err != nil || yuan.Path != "data.list.*.amount" || yuan.Op != 0 || yuan.Unit != "元" || yuan.Spec() != "data.list.*.amount元" {
+		t.Fatalf("字段名后的单位没认出来: %+v %v", yuan, err)
+	}
+	got = renderFields([]apiField{yuan}, map[string]any{
+		"data": map[string]any{
+			"list": []any{map[string]any{"amount": "27465.55"}},
+		},
+	})
+	if got != "金额: 27465.55元" {
+		t.Fatalf("元没有跟上:\n%s", got)
+	}
+}
+
+func TestRenderPairedListFields(t *testing.T) {
+	payload := map[string]any{
+		"data": map[string]any{
+			"sum": "105780.78",
+			"list": []any{
+				map[string]any{"amount": "27465.55", "deptname": "肆狼三组"},
+				map[string]any{"amount": "8934.22", "deptname": "寒锋组"},
+			},
+		},
+	}
+	got := renderFields([]apiField{
+		{Label: "部门", Path: "data.list.*.deptname"},
+		{Label: "金额", Path: "data.list.*.amount"},
+		{Label: "合计", Path: "data.sum"},
+	}, payload)
+	want := "部门: 肆狼三组  金额: 27465.55\n部门: 寒锋组  金额: 8934.22\n合计: 105780.78"
+	if got != want {
+		t.Fatalf("明细没有排在一行:\n%s", got)
 	}
 }
 
@@ -342,5 +411,67 @@ func TestAPIDateVars(t *testing.T) {
 	}
 	if strings.Contains(stored, "20261013") || (!strings.Contains(stored, "{yesterday}") && !strings.Contains(stored, "%7Byesterday%7D")) {
 		t.Fatalf("保存时要留下变量，不要写成具体日期: %s", stored)
+	}
+}
+
+func TestAPICurlShowsExpandedRequest(t *testing.T) {
+	previous := apiClock
+	apiClock = func() time.Time { return time.Date(2026, 10, 14, 16, 0, 0, 0, time.Local) }
+	t.Cleanup(func() { apiClock = previous })
+
+	curl, err := APICurl("POST https://example.com/report/{yesterday}\n" +
+		"Header: Authorization: Bearer a'b\n" +
+		`Body: {"day":"{today}"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"curl.exe --request POST",
+		"--url 'https://example.com/report/20261013'",
+		"--header 'Authorization: Bearer a''b'",
+		"--header 'Accept: application/json, text/json;q=0.9, */*;q=0.1'",
+		"--header 'Content-Type: application/json; charset=utf-8'",
+		`--data-raw '{"day":"20261014"}'`,
+	} {
+		if !strings.Contains(curl, want) {
+			t.Fatalf("缺少 %s\n%s", want, curl)
+		}
+	}
+	if strings.Contains(curl, "{today}") || strings.Contains(curl, "{yesterday}") {
+		t.Fatalf("curl 里还应留着变量: %s", curl)
+	}
+}
+
+func TestAPIRunLogKeepsCurlOutOfWechat(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"ok":true}}`))
+	}))
+	defer srv.Close()
+	book := openTestBook(t)
+	saved, err := book.Save(Task{
+		Name: "接口", Account: "工作", Enabled: true,
+		Kind: KindAPI, Body: srv.URL + "\ndata.ok",
+		Mode: ModeDaily, At: "08:30",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sent string
+	if _, err := book.RunOne(context.Background(), saved.ID, func(_ context.Context, _, _, text string) error {
+		sent = text
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(sent, "curl") {
+		t.Fatalf("不应把 curl 发给微信: %s", sent)
+	}
+	logs, err := book.Logs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 || !strings.Contains(logs[0].Text, "curl.exe --request GET") || !strings.Contains(logs[0].Text, srv.URL) {
+		t.Fatalf("日志应留下完整 curl: %+v", logs)
 	}
 }

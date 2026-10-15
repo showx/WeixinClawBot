@@ -10,7 +10,47 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
+
+func TestCopyTask(t *testing.T) {
+	src := Task{
+		ID: "a", Name: "魔光后台", Account: "工作", Accounts: []string{"工作", "生活"},
+		Kind: KindAPI, Body: "https://example.com\ndata.sum",
+		ShowTime: true, Prefix: "下午汇总",
+		Mode: ModeDaily, At: "08:30", Enabled: true,
+		LastRun: time.Now(), LastResult: "已发送",
+	}
+	next := src.Copy()
+	if next.ID != "" || !next.LastRun.IsZero() || next.LastResult != "" {
+		t.Fatalf("副本不应带上运行记录: %+v", next)
+	}
+	if next.Name != "魔光后台 副本" || next.Body != src.Body || !next.ShowTime || next.Prefix != src.Prefix {
+		t.Fatalf("副本内容不对: %+v", next)
+	}
+	next.Accounts[0] = "改掉"
+	if src.Accounts[0] != "工作" {
+		t.Fatal("改副本不应改到原来的微信")
+	}
+	long := Task{Name: strings.Repeat("名", 32)}
+	if n := utf8.RuneCountInString(long.Copy().Name); n > 32 || !strings.HasSuffix(long.Copy().Name, "副本") {
+		t.Fatalf("长名称副本: %s", long.Copy().Name)
+	}
+}
+
+func TestDecorateMessage(t *testing.T) {
+	now := time.Date(2026, 10, 14, 16, 57, 0, 0, time.Local)
+	task := Task{Name: "魔光后台", ShowTime: true, ShowName: true, Prefix: "下午汇总"}
+	got := task.Decorate("部门: 肆狼三组  金额: 27465.55", now)
+	want := "下午汇总\n时间: 2026-10-14 16:57\n任务: 魔光后台\n部门: 肆狼三组  金额: 27465.55"
+	if got != want {
+		t.Fatalf("附带内容不对:\n%s", got)
+	}
+	plain := Task{Name: "早报"}.Decorate("你好", now)
+	if plain != "你好" {
+		t.Fatalf("没勾选时不应加内容: %s", plain)
+	}
+}
 
 func TestDailyDue(t *testing.T) {
 	now := time.Date(2026, 10, 12, 10, 0, 0, 0, time.Local)

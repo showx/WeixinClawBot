@@ -146,57 +146,73 @@ func (b *Book) writeLogs(logs []RunLog) error {
 	return nil
 }
 
+// Kind 是这条记录从哪里来的。
+func (e RunLog) Kind() string {
+	switch {
+	case e.Phone:
+		return "手机"
+	case e.Live:
+		return "即时"
+	case e.Manual:
+		return "试跑"
+	default:
+		return "定时"
+	}
+}
+
 // Line 是日志列表里的一行。
 func (e RunLog) Line() string {
 	when := e.Time.Local().Format("01-02 15:04")
+	return when + "  " + e.Kind() + " · " + logName(e) + "  " + oneLine(e.Result, 48)
+}
+
+func logName(e RunLog) string {
 	name := strings.TrimSpace(e.Name)
 	if name == "" {
-		name = "未命名"
+		return "未命名"
 	}
-	how := ""
-	switch {
-	case e.Phone:
-		how = "手机 · "
-	case e.Live:
-		how = "即时 · "
-	case e.Manual:
-		how = "试跑 · "
+	return name
+}
+
+func logTo(e RunLog) string {
+	to := strings.TrimSpace(e.To)
+	if to == "" {
+		return "最近会话"
 	}
-	result := oneLine(e.Result, 48)
-	return when + "  " + how + name + "  " + result
+	return to
 }
 
 // Detail 是选中一条日志后看到的全文。
 func (e RunLog) Detail() string {
-	to := strings.TrimSpace(e.To)
-	if to == "" {
-		to = "最近会话"
-	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s\n", e.Time.Local().Format("2006-01-02 15:04:05"))
+	fmt.Fprintf(&b, "%s    %s\n", e.Time.Local().Format("2006-01-02 15:04:05"), e.Kind())
 	if e.Phone {
-		who := to
-		if e.Account != "" {
-			fmt.Fprintf(&b, "对方从手机发给微信「%s」\n来自 %s\n\n", e.Account, who)
-		} else {
-			fmt.Fprintf(&b, "对方从手机发给 ClawBot\n来自 %s\n\n", who)
+		if account := strings.TrimSpace(e.Account); account != "" {
+			fmt.Fprintf(&b, "微信    %s\n", account)
 		}
-		b.WriteString(e.Text)
+		fmt.Fprintf(&b, "来自    %s\n", logTo(e))
+		writeLogBody(&b, "消息", e.Text)
 		return b.String()
 	}
-	switch {
-	case e.Live:
-		b.WriteString("即时发送\n")
-	case e.Manual:
-		b.WriteString("定时任务试跑\n")
+	fmt.Fprintf(&b, "任务    %s\n", logName(e))
+	if account := strings.TrimSpace(e.Account); account != "" {
+		fmt.Fprintf(&b, "微信    %s\n", account)
 	}
-	fmt.Fprintf(&b, "%s → %s\n", e.Account, to)
-	fmt.Fprintf(&b, "%s\n", e.Result)
+	fmt.Fprintf(&b, "发给    %s\n", logTo(e))
+	fmt.Fprintf(&b, "结果    %s\n", strings.TrimSpace(e.Result))
 	if strings.TrimSpace(e.Text) == "" {
 		b.WriteString("\n这次没有发出内容。")
 		return b.String()
 	}
-	b.WriteString("\n")
-	b.WriteString(e.Text)
+	writeLogBody(&b, "内容", e.Text)
 	return b.String()
+}
+
+func writeLogBody(b *strings.Builder, title, text string) {
+	b.WriteString("\n")
+	b.WriteString(title)
+	b.WriteString("\n")
+	b.WriteString(strings.Repeat("—", 28))
+	b.WriteString("\n")
+	b.WriteString(strings.TrimSpace(text))
 }

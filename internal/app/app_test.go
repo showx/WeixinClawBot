@@ -196,6 +196,51 @@ func TestTerminalQRFitsWideConsole(t *testing.T) {
 	}
 }
 
+func TestReplyReceivedIncludesTime(t *testing.T) {
+	var sent string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Msg struct {
+				ItemList []struct {
+					TextItem struct {
+						Text string `json:"text"`
+					} `json:"text_item"`
+				} `json:"item_list"`
+			} `json:"msg"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		if len(body.Msg.ItemList) > 0 {
+			sent = body.Msg.ItemList[0].TextItem.Text
+		}
+		_, _ = w.Write([]byte(`{"ret":0}`))
+	}))
+	defer upstream.Close()
+	st := openStore(t)
+	if err := st.SaveCredentials(store.Credentials{BotToken: "tok", BaseURL: upstream.URL, BotID: "bot"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertSession("u@im.wechat", "ctx-1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	application := &App{Store: st, Client: ilink.NewClient()}
+	reply, err := application.ReplyReceived(context.Background(), "", "u@im.wechat", "你好")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply != sent || !strings.HasPrefix(reply, "收到 ") {
+		t.Fatalf("reply=%q sent=%q", reply, sent)
+	}
+	if _, err := time.ParseInLocation("2006-01-02 15:04:05", strings.TrimPrefix(reply, "收到 "), time.Local); err != nil {
+		t.Fatal(err)
+	}
+	again, err := application.ReplyReceived(context.Background(), "", "u@im.wechat", reply)
+	if err != nil || again != "" {
+		t.Fatalf("不应回复自己的回执: %q %v", again, err)
+	}
+}
+
 func TestWatchShowsPhoneText(t *testing.T) {
 	var polls int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

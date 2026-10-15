@@ -247,7 +247,7 @@ func hostToBase(host string) string {
 	return "https://" + host
 }
 
-// Watch 长轮询入站消息，只为刷新每个用户的 context_token，不会自动回复。
+// Watch 长轮询入站消息，用来刷新每个用户的 context_token。自动回复由收到消息后的回调发出。
 func (a *App) Watch(ctx context.Context) error {
 	creds, err := a.loggedIn()
 	if err != nil {

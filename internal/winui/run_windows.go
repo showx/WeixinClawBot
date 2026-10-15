@@ -61,6 +61,9 @@ func run(application *app.App, listen, token string) error {
 		}
 		application.SetOnIncoming(func(msg app.Incoming) {
 			book.AddPhone(msg.Account, msg.UserID, msg.Text)
+			application.AckIncoming(msg, func(reply string, err error) {
+				noteAck(book, msg, reply, err)
+			})
 		})
 		go book.Loop(ctx, func(ctx context.Context, account, to, text string) error {
 			_, err := application.SendAccount(ctx, account, to, text)
@@ -86,7 +89,7 @@ func openWindow(application *app.App, book *schedule.Book, ctx context.Context, 
 		token:     token,
 		accounts:  &textModel{},
 		sessions:  &textModel{},
-		sendModel: &textModel{},
+		sendModel: &logTable{},
 	}
 	scheduleOn := true
 	if book != nil {
@@ -106,7 +109,7 @@ func openWindow(application *app.App, book *schedule.Book, ctx context.Context, 
 			Composite{
 				Layout: HBox{MarginsZero: true},
 				Children: []Widget{
-					Label{Text: "窗口开着就会监听微信。勾选「到点执行」后，定时任务才会自动发。"},
+					Label{Text: "窗口开着就会监听微信。对方发来消息会自动回复「收到」和当前时间。勾选「到点执行」后，定时任务才会自动发。"},
 					HSpacer{},
 					CheckBox{AssignTo: &ui.scheduleOn, Text: "到点执行", Checked: scheduleOn, Enabled: book != nil, OnCheckedChanged: ui.onScheduleSwitch},
 					PushButton{Text: "定时任务", OnClicked: ui.tasks},
@@ -175,12 +178,24 @@ func openWindow(application *app.App, book *schedule.Book, ctx context.Context, 
 				},
 			},
 			Label{Text: "发送日志", TextColor: walk.RGB(80, 80, 80)},
-			ListBox{
-				AssignTo:              &ui.sendList,
-				Model:                 ui.sendModel,
-				StretchFactor:         1,
-				MinSize:               Size{Height: 96},
-				OnCurrentIndexChanged: ui.showSend,
+			TableView{
+				AssignTo:                 &ui.sendList,
+				Model:                    ui.sendModel,
+				AlternatingRowBG:         true,
+				LastColumnStretched:      true,
+				NotSortableByHeaderClick: true,
+				ColumnsSizable:           true,
+				StretchFactor:            1,
+				MinSize:                  Size{Height: 120},
+				Font:                     Font{Family: "Microsoft YaHei UI", PointSize: 9},
+				OnCurrentIndexChanged:    ui.showSend,
+				Columns: []TableViewColumn{
+					{Title: "时间", Width: 108},
+					{Title: "来源", Width: 52},
+					{Title: "名称", Width: 160},
+					{Title: "发给", Width: 140},
+					{Title: "结果", Width: 220},
+				},
 			},
 			TextEdit{
 				AssignTo:      &ui.sendBody,
@@ -188,8 +203,8 @@ func openWindow(application *app.App, book *schedule.Book, ctx context.Context, 
 				VScroll:       true,
 				HScroll:       true,
 				StretchFactor: 1,
-				MinSize:       Size{Height: 88},
-				Font:          Font{Family: "Consolas", PointSize: 10},
+				MinSize:       Size{Height: 96},
+				Font:          Font{Family: "Microsoft YaHei UI", PointSize: 10},
 				Text:          "还没有记录。在这里发消息、定时任务到点，或对方从手机发来消息之后，会出现在上面。",
 			},
 			Composite{
@@ -205,6 +220,9 @@ func openWindow(application *app.App, book *schedule.Book, ctx context.Context, 
 		return err
 	}
 	ui.refresh()
+	if ui.sendList != nil {
+		ui.sendList.SetGridlines(true)
+	}
 	ui.refreshSends(true)
 	stop := make(chan struct{})
 	go ui.poll(stop)
@@ -236,6 +254,47 @@ type textModel struct {
 func (m *textModel) ItemCount() int              { return len(m.items) }
 func (m *textModel) Value(index int) interface{} { return m.items[index] }
 
+type logTable struct {
+	walk.TableModelBase
+	rows []schedule.RunLog
+}
+
+func (m *logTable) RowCount() int {
+	if m == nil {
+		return 0
+	}
+	return len(m.rows)
+}
+
+func (m *logTable) Value(row, col int) interface{} {
+	if m == nil || row < 0 || row >= len(m.rows) {
+		return ""
+	}
+	item := m.rows[row]
+	switch col {
+	case 0:
+		return item.Time.Local().Format("01-02 15:04")
+	case 1:
+		return item.Kind()
+	case 2:
+		name := strings.TrimSpace(item.Name)
+		if name == "" {
+			return "未命名"
+		}
+		return name
+	case 3:
+		to := strings.TrimSpace(item.To)
+		if to == "" {
+			return "最近会话"
+		}
+		return to
+	case 4:
+		return preview(item.Result, 80)
+	default:
+		return ""
+	}
+}
+
 type desk struct {
 	app           *app.App
 	book          *schedule.Book
@@ -253,11 +312,11 @@ type desk struct {
 	sendBtn       *walk.PushButton
 	notice        *walk.TextEdit
 	apiAddr       *walk.LineEdit
-	sendList      *walk.ListBox
+	sendList      *walk.TableView
 	sendBody      *walk.TextEdit
 	accounts      *textModel
 	sessions      *textModel
-	sendModel     *textModel
+	sendModel     *logTable
 	sendRows      []schedule.RunLog
 	sendHead      string
 	sendQuiet     bool
@@ -640,6 +699,30 @@ func (d *desk) syncScheduleSwitch() {
 	d.scheduleQuiet = false
 }
 
+func noteAck(book *schedule.Book, msg app.Incoming, reply string, err error) {
+	if book == nil {
+		return
+	}
+	entry := schedule.RunLog{
+		Name:    "自动回复",
+		Account: msg.Account,
+		To:      msg.UserID,
+		Live:    true,
+		Text:    reply,
+	}
+	if err != nil {
+		entry.Result = "发送失败：" + headLine(err.Error())
+		if reply != "" {
+			entry.Text = reply + "\n\n" + err.Error()
+		} else {
+			entry.Text = err.Error()
+		}
+	} else {
+		entry.Result = "已发送"
+	}
+	book.AddLog(entry)
+}
+
 func (d *desk) noteLiveSend(account, to, text string, result app.SendResult, err error) {
 	if d.book == nil {
 		return
@@ -706,13 +789,9 @@ func (d *desk) refreshSends(follow bool) {
 	}
 	d.sendRows = logs
 	d.sendHead = head
-	labels := make([]string, len(logs))
-	for i, item := range logs {
-		labels[i] = item.Line()
-	}
-	d.sendModel.items = labels
+	d.sendModel.rows = logs
 	d.sendQuiet = true
-	d.sendModel.PublishItemsReset()
+	d.sendModel.PublishRowsReset()
 	d.sendQuiet = false
 	if len(logs) == 0 {
 		_ = d.sendList.SetCurrentIndex(-1)

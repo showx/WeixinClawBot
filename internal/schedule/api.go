@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -32,8 +34,11 @@ type apiTarget struct {
 }
 
 type apiField struct {
-	Label string
-	Path  string
+	Label  string
+	Path   string
+	Op     byte
+	Factor float64
+	Unit   string
 }
 
 type apiHeader struct {
@@ -61,6 +66,7 @@ type APIPreview struct {
 	Millis  int64
 	Raw     string
 	Vars    string
+	Curl    string
 }
 
 func parseAPIBody(body string) (apiTarget, error) {
@@ -234,13 +240,107 @@ func parseAPIFieldLine(line string) (apiField, error) {
 	if path == "" {
 		return apiField{}, errors.New("请填写字段路径")
 	}
-	if err := checkAPIField(path); err != nil {
+	clean, op, factor, unit, err := splitScale(path)
+	if err != nil {
+		return apiField{}, err
+	}
+	if op == 0 {
+		clean, unit, err = splitTrailingUnit(clean)
+		if err != nil {
+			return apiField{}, err
+		}
+	}
+	if err := checkAPIField(clean); err != nil {
 		return apiField{}, err
 	}
 	if utf8.RuneCountInString(label) > 40 {
 		return apiField{}, errors.New("显示名太长")
 	}
-	return apiField{Label: label, Path: path}, nil
+	return apiField{Label: label, Path: clean, Op: op, Factor: factor, Unit: unit}, nil
+}
+
+func splitScale(path string) (string, byte, float64, string, error) {
+	i := strings.LastIndexAny(path, "*/")
+	if i <= 0 || i >= len(path)-1 {
+		return path, 0, 0, "", nil
+	}
+	factor, unit, ok := parseScaledTail(path[i+1:])
+	if !ok {
+		if path[i] == '/' {
+			return "", 0, 0, "", errors.New("换算要写成 /100 这种，例如 data.list.*.cost/100美元")
+		}
+		return path, 0, 0, "", nil
+	}
+	if unit != "" && (utf8.RuneCountInString(unit) > 8 || strings.ContainsAny(unit, " \t=./\\*")) {
+		return "", 0, 0, "", errors.New("单位直接写在数字后面，例如 /100美元，中间不要空格")
+	}
+	clean := path[:i]
+	if clean == "" || strings.HasSuffix(clean, ".") {
+		return path, 0, 0, "", nil
+	}
+	return clean, path[i], factor, unit, nil
+}
+
+// splitTrailingUnit 把字段名末尾的单位剥下来，例如 amount元。
+func splitTrailingUnit(path string) (string, string, error) {
+	head, last := "", path
+	if i := strings.LastIndex(path, "."); i >= 0 {
+		head = path[:i+1]
+		last = path[i+1:]
+	}
+	end := 0
+	for _, r := range last {
+		if isFieldRune(r) {
+			end += utf8.RuneLen(r)
+			continue
+		}
+		break
+	}
+	if end == 0 || end == len(last) {
+		return path, "", nil
+	}
+	unit := last[end:]
+	if utf8.RuneCountInString(unit) > 8 || strings.ContainsAny(unit, " \t=./\\*") {
+		return "", "", errors.New("单位直接写在字段或数字后面，例如 data.list.*.amount元，中间不要空格")
+	}
+	return head + last[:end], unit, nil
+}
+
+func isFieldRune(r rune) bool {
+	return r == '_' || r == '-' || (r >= '0' && r <= '9') || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z')
+}
+
+func parseScaledTail(tail string) (float64, string, bool) {
+	i := 0
+	dot := false
+	for i < len(tail) {
+		c := tail[i]
+		if c >= '0' && c <= '9' {
+			i++
+			continue
+		}
+		if c == '.' && !dot {
+			dot = true
+			i++
+			continue
+		}
+		break
+	}
+	if i == 0 || tail[i-1] == '.' {
+		return 0, "", false
+	}
+	factor, err := strconv.ParseFloat(tail[:i], 64)
+	if err != nil || factor <= 0 || math.IsInf(factor, 0) {
+		return 0, "", false
+	}
+	return factor, tail[i:], true
+}
+
+func (f apiField) Spec() string {
+	if f.Op == 0 || f.Factor == 0 {
+		return f.Path + f.Unit
+	}
+	return f.Path + string(f.Op) + formatNumber(f.Factor) + f.Unit
 }
 
 func splitLabel(line string) (label, path string, labeled bool) {
@@ -400,16 +500,18 @@ func DecodeAPI(body string) APIForm {
 	form.Headers = strings.Join(headers, "\n")
 	var fields []string
 	for _, field := range target.Fields {
-		if field.Label != "" && field.Label != field.Path {
-			fields = append(fields, field.Label+" = "+field.Path)
+		spec := field.Spec()
+		if field.Label != "" && field.Label != spec {
+			fields = append(fields, field.Label+" = "+spec)
 			continue
 		}
-		fields = append(fields, field.Path)
+		fields = append(fields, spec)
 	}
 	for _, field := range target.OffFields {
-		line := field.Path
-		if field.Label != "" && field.Label != field.Path {
-			line = field.Label + " = " + field.Path
+		spec := field.Spec()
+		line := spec
+		if field.Label != "" && field.Label != spec {
+			line = field.Label + " = " + spec
 		}
 		fields = append(fields, "// "+line)
 	}
@@ -480,12 +582,14 @@ func PreviewAPI(ctx context.Context, body string) (APIPreview, error) {
 	defer cancel()
 	vars := apiVarNote(target)
 	target = applyAPIVars(target)
+	curl := formatAPICurl(target)
 	started := time.Now()
 	status, raw, err := doAPI(ctx, target)
 	if err != nil {
-		return APIPreview{}, err
+		return APIPreview{Curl: curl, Vars: vars}, err
 	}
 	var preview APIPreview
+	preview.Curl = curl
 	preview.Status = status
 	preview.Millis = time.Since(started).Milliseconds()
 	preview.Raw = prettyJSON(raw)
@@ -594,6 +698,60 @@ func expandAPIText(text string, now time.Time) string {
 	return strings.NewReplacer(pairs...).Replace(text)
 }
 
+// APICurl 是这次接口任务实际会发出的请求，日期变量已经换成当天的值。
+func APICurl(body string) (string, error) {
+	target, err := parseAPITarget(body, false)
+	if err != nil {
+		return "", err
+	}
+	return formatAPICurl(applyAPIVars(target)), nil
+}
+
+func formatAPICurl(target apiTarget) string {
+	method := target.Method
+	if method == "" {
+		method = http.MethodGet
+	}
+	headers := http.Header{}
+	headers.Set("Accept", "application/json, text/json;q=0.9, */*;q=0.1")
+	for _, header := range target.Headers {
+		headers.Set(header.Name, header.Value)
+	}
+	body := ""
+	if method == http.MethodPost {
+		body = target.Body
+	}
+	if method == http.MethodPost && strings.TrimSpace(body) != "" && headers.Get("Content-Type") == "" {
+		trimmed := strings.TrimSpace(body)
+		if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+			headers.Set("Content-Type", "application/json; charset=utf-8")
+		}
+	}
+	names := make([]string, 0, len(headers))
+	for name := range headers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	b.WriteString("curl.exe --request ")
+	b.WriteString(method)
+	b.WriteString(" --url ")
+	b.WriteString(psQuote(target.URL))
+	for _, name := range names {
+		b.WriteString(" --header ")
+		b.WriteString(psQuote(name + ": " + headers.Get(name)))
+	}
+	if method == http.MethodPost && body != "" {
+		b.WriteString(" --data-raw ")
+		b.WriteString(psQuote(body))
+	}
+	return b.String()
+}
+
+func psQuote(text string) string {
+	return "'" + strings.ReplaceAll(text, "'", "''") + "'"
+}
+
 func doAPI(ctx context.Context, target apiTarget) (int, []byte, error) {
 	method := target.Method
 	if method == "" {
@@ -656,21 +814,182 @@ func prettyJSON(raw []byte) string {
 
 func renderFields(fields []apiField, payload any) string {
 	var lines []string
-	for _, field := range fields {
+	used := make([]bool, len(fields))
+	for i, field := range fields {
+		if used[i] {
+			continue
+		}
+		if group := sameListFields(fields, used, i); len(group) >= 2 {
+			lines = append(lines, renderZipped(group, payload))
+			continue
+		}
 		values, total, found := collectJSON(payload, strings.Split(field.Path, "."))
-		lines = append(lines, renderField(fieldLabel(field), values, total, found))
+		lines = append(lines, renderField(field, values, total, found))
 	}
 	return strings.Join(lines, "\n")
+}
+
+func sameListFields(fields []apiField, used []bool, start int) []apiField {
+	base, ok := listBase(fields[start].Path)
+	if !ok {
+		return nil
+	}
+	var group []apiField
+	for i := start; i < len(fields); i++ {
+		if used[i] {
+			continue
+		}
+		other, match := listBase(fields[i].Path)
+		if !match || other != base {
+			continue
+		}
+		group = append(group, fields[i])
+		used[i] = true
+	}
+	if len(group) < 2 {
+		used[start] = false
+	}
+	return group
+}
+
+func listBase(path string) (string, bool) {
+	parts := strings.Split(path, ".")
+	for i, part := range parts {
+		if part == "*" {
+			return strings.Join(parts[:i], "."), true
+		}
+	}
+	return "", false
+}
+
+func listSuffix(path string) []string {
+	parts := strings.Split(path, ".")
+	for i, part := range parts {
+		if part == "*" {
+			if i+1 >= len(parts) {
+				return nil
+			}
+			return parts[i+1:]
+		}
+	}
+	return nil
+}
+
+func renderZipped(fields []apiField, payload any) string {
+	base, _ := listBase(fields[0].Path)
+	var parts []string
+	if base != "" {
+		parts = strings.Split(base, ".")
+	}
+	values, _, found := collectJSON(payload, parts)
+	if !found || len(values) != 1 {
+		return fieldLabel(fields[0]) + ": （没有这个字段）"
+	}
+	items, ok := values[0].([]any)
+	if !ok {
+		return fieldLabel(fields[0]) + ": （没有这个字段）"
+	}
+	if len(items) == 0 {
+		return fieldLabel(fields[0]) + ": （没有内容）"
+	}
+	limit := len(items)
+	if limit > maxAPIItems {
+		limit = maxAPIItems
+	}
+	var lines []string
+	for _, item := range items[:limit] {
+		var pairs []string
+		for _, field := range fields {
+			value, ok := lookupPath(item, listSuffix(field.Path))
+			if !ok {
+				pairs = append(pairs, fieldLabel(field)+": （没有这个字段）")
+				continue
+			}
+			if isScalar(value) {
+				pairs = append(pairs, fieldLabel(field)+": "+formatFieldValue(field, value))
+				continue
+			}
+			pairs = append(pairs, fieldLabel(field)+": "+compactJSON(value))
+		}
+		lines = append(lines, strings.Join(pairs, "  "))
+	}
+	if len(items) > limit {
+		lines = append(lines, fmt.Sprintf("…还有 %d 条", len(items)-limit))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func lookupPath(node any, parts []string) (any, bool) {
+	if len(parts) == 0 {
+		return node, true
+	}
+	obj, ok := node.(map[string]any)
+	if !ok || parts[0] == "*" {
+		return nil, false
+	}
+	next, ok := obj[parts[0]]
+	if !ok {
+		return nil, false
+	}
+	return lookupPath(next, parts[1:])
 }
 
 func fieldLabel(field apiField) string {
 	if strings.TrimSpace(field.Label) != "" {
 		return field.Label
 	}
+	if spec := field.Spec(); spec != "" {
+		return spec
+	}
 	return field.Path
 }
 
-func renderField(label string, values []any, total int, found bool) string {
+func formatFieldValue(field apiField, value any) string {
+	if !isScalar(value) {
+		return formatScalar(value)
+	}
+	if field.Op == 0 || field.Factor == 0 {
+		return formatScalar(value) + field.Unit
+	}
+	n, ok := numberValue(value)
+	if !ok {
+		return formatScalar(value)
+	}
+	switch field.Op {
+	case '/':
+		n /= field.Factor
+	case '*':
+		n *= field.Factor
+	}
+	if math.IsNaN(n) || math.IsInf(n, 0) {
+		return "（无法换算）"
+	}
+	return formatNumber(n) + field.Unit
+}
+
+func numberValue(value any) (float64, bool) {
+	switch typed := value.(type) {
+	case json.Number:
+		n, err := typed.Float64()
+		return n, err == nil
+	case float64:
+		return typed, true
+	case string:
+		n, err := strconv.ParseFloat(strings.TrimSpace(typed), 64)
+		return n, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func formatNumber(n float64) string {
+	text := strconv.FormatFloat(n, 'f', 2, 64)
+	text = strings.TrimRight(text, "0")
+	return strings.TrimRight(text, ".")
+}
+
+func renderField(field apiField, values []any, total int, found bool) string {
+	label := fieldLabel(field)
 	if !found {
 		return label + ": （没有这个字段）"
 	}
@@ -678,7 +997,19 @@ func renderField(label string, values []any, total int, found bool) string {
 		return label + ": （没有内容）"
 	}
 	if len(values) == 1 && isScalar(values[0]) {
-		return label + ": " + formatScalar(values[0])
+		return label + ": " + formatFieldValue(field, values[0])
+	}
+	if field.Op != 0 && allScalar(values) {
+		var b strings.Builder
+		b.WriteString(label)
+		b.WriteString(":\n")
+		for _, value := range values {
+			fmt.Fprintf(&b, "  - %s\n", formatFieldValue(field, value))
+		}
+		if total > len(values) {
+			fmt.Fprintf(&b, "  …还有 %d 条\n", total-len(values))
+		}
+		return strings.TrimRight(b.String(), "\n")
 	}
 	var b strings.Builder
 	b.WriteString(label)

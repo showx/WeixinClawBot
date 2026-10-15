@@ -35,6 +35,9 @@ type Task struct {
 	Mode         string    `json:"mode"`
 	At           string    `json:"at,omitempty"`
 	EveryMinutes int       `json:"every_minutes,omitempty"`
+	ShowTime     bool      `json:"show_time,omitempty"`
+	ShowName     bool      `json:"show_name,omitempty"`
+	Prefix       string    `json:"prefix,omitempty"`
 	LastRun      time.Time `json:"last_run,omitempty"`
 	LastResult   string    `json:"last_result,omitempty"`
 }
@@ -87,6 +90,9 @@ func (t Task) Validate() error {
 	}
 	if utf8.RuneCountInString(strings.TrimSpace(t.To)) > 128 {
 		return fmt.Errorf("接收者太长")
+	}
+	if utf8.RuneCountInString(strings.TrimSpace(t.Prefix)) > 200 {
+		return fmt.Errorf("附言最多 200 个字")
 	}
 	switch t.Kind {
 	case KindText, KindCommand, KindPage, KindAPI, KindBrowse:
@@ -192,6 +198,34 @@ func (t Task) AccountNames() []string {
 	return names
 }
 
+// Copy 复制一条任务，名称加上「副本」，清空运行记录。保存后才写进列表。
+func (t Task) Copy() Task {
+	if t.Accounts != nil {
+		t.Accounts = append([]string(nil), t.Accounts...)
+	}
+	t.ID = ""
+	t.LastRun = time.Time{}
+	t.LastResult = ""
+	t.Name = copyName(t.Name)
+	return t
+}
+
+func copyName(name string) string {
+	name = strings.TrimSpace(name)
+	const suffix = " 副本"
+	if name == "" {
+		return "副本"
+	}
+	if !strings.HasSuffix(name, suffix) {
+		name += suffix
+	}
+	if n := utf8.RuneCountInString(name); n > 32 {
+		keep := 32 - utf8.RuneCountInString(suffix)
+		name = string([]rune(name)[:keep]) + suffix
+	}
+	return name
+}
+
 // AccountLabel 用顿号把多个微信拼成一行。
 func (t Task) AccountLabel() string {
 	names := t.AccountNames()
@@ -252,6 +286,41 @@ func normalizeClock(at string) (string, bool) {
 		return "", false
 	}
 	return fmt.Sprintf("%02d:%02d", hour, minute), true
+}
+
+// Decorate 把勾选的附言、发送时间和任务名称写在正文前面。
+func (t Task) Decorate(body string, now time.Time) string {
+	return DecorateMessage(MessagePreface(t.Name, t.ShowTime, t.ShowName, t.Prefix, now), body)
+}
+
+// MessagePreface 是勾选后要加在正文前面的几行。
+func MessagePreface(name string, showTime, showName bool, prefix string, now time.Time) string {
+	var lines []string
+	if text := strings.TrimSpace(prefix); text != "" {
+		lines = append(lines, text)
+	}
+	if showTime && !now.IsZero() {
+		lines = append(lines, "时间: "+now.Format("2006-01-02 15:04"))
+	}
+	if showName {
+		if name = strings.TrimSpace(name); name != "" {
+			lines = append(lines, "任务: "+name)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// DecorateMessage 把附带内容写在正文前面。
+func DecorateMessage(preface, body string) string {
+	preface = strings.TrimSpace(preface)
+	body = strings.TrimSpace(body)
+	if preface == "" {
+		return body
+	}
+	if body == "" {
+		return preface
+	}
+	return preface + "\n" + body
 }
 
 func truncateRunes(s string, limit int) (string, bool) {

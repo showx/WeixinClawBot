@@ -82,6 +82,7 @@ type apiStudio struct {
 	params      *kvList
 	headers     *kvList
 	fields      *kvList
+	preface     func() string
 	syncing     bool
 	sending     bool
 }
@@ -187,7 +188,10 @@ func (s *apiStudio) send() {
 			s.sending = false
 			s.sendBtn.SetEnabled(true)
 			if err != nil {
-				s.status.SetText(message)
+				s.status.SetText(headLine(message))
+				if preview.Curl != "" {
+					_ = s.response.SetText("curl：\n" + preview.Curl + "\n\n" + message)
+				}
 				return
 			}
 			s.showPreview(preview)
@@ -211,16 +215,40 @@ func (s *apiStudio) showPreview(preview schedule.APIPreview) {
 	}
 	s.status.SetText(line)
 	text := preview.Raw
-	if preview.Message != "" && !whole {
+	if preview.Curl != "" {
+		text = "curl：\n" + preview.Curl
+		if preview.Raw != "" {
+			text += "\n\n" + preview.Raw
+		}
+	}
+	head := ""
+	if s.preface != nil {
+		head = s.preface()
+	}
+	message := preview.Message
+	if strings.TrimSpace(message) != "" {
+		message = schedule.DecorateMessage(head, message)
+	}
+	if message != "" && (!whole || strings.TrimSpace(head) != "") {
 		if text != "" {
 			text += "\n\n"
 		}
-		text += "会发给微信：\n" + preview.Message
+		text += "会发给微信：\n" + message
 	}
 	_ = s.response.SetText(text)
 	s.choicePaths = splitLines(preview.Fields)
 	s.choiceModel.items = append([]string(nil), preview.Choices...)
 	s.choiceModel.PublishItemsReset()
+}
+
+func (s *apiStudio) addField() {
+	if s == nil || s.fields == nil {
+		return
+	}
+	s.fields.addAndShow(schedule.APIRow{Enabled: true})
+	if s.status != nil {
+		s.status.SetText("已加一行。左边写显示名，右边写路径，例如 data.list")
+	}
 }
 
 func (s *apiStudio) takeSelected() {
@@ -263,14 +291,15 @@ func splitLines(text string) []string {
 }
 
 type kvLine struct {
-	on  *walk.CheckBox
-	key *walk.LineEdit
-	val *walk.LineEdit
-	box *walk.Composite
+	on    *walk.CheckBox
+	key   *walk.LineEdit
+	val   *walk.LineEdit
+	box   *walk.Composite
+	sized int
 }
 
 type kvList struct {
-	parent   *walk.ScrollView
+	parent   *walk.Composite
 	header   *walk.Composite
 	lines    []*kvLine
 	keyCue   string
@@ -282,7 +311,7 @@ type kvList struct {
 	width    int
 }
 
-func newKVList(parent *walk.ScrollView, keyCue, valCue string, onChange func()) *kvList {
+func newKVList(parent *walk.Composite, keyCue, valCue string, onChange func()) *kvList {
 	list := &kvList{parent: parent, keyCue: keyCue, valCue: valCue, onChange: onChange}
 	if parent == nil {
 		return list
@@ -338,10 +367,10 @@ func (l *kvList) set(rows []schedule.APIRow) {
 		}
 	}
 	l.parent.SetSuspended(false)
-	l.parent.RequestLayout()
 	l.onChange = prev
 	l.ensureTrailing()
 	l.fitWidth()
+	l.fitHeight()
 }
 
 func (l *kvList) addHeader() *walk.Composite {
@@ -456,10 +485,47 @@ func (l *kvList) add(row schedule.APIRow) {
 	on.CheckedChanged().Attach(changed)
 	key.TextChanged().Attach(changed)
 	val.TextChanged().Attach(changed)
-	l.parent.RequestLayout()
 	l.fitWidth()
+	l.fitHeight()
 	if l.onChange != nil {
 		l.onChange()
+	}
+}
+
+func (l *kvList) addAndShow(row schedule.APIRow) {
+	if l == nil {
+		return
+	}
+	before := len(l.lines)
+	l.add(row)
+	if l.parent == nil || len(l.lines) <= before {
+		return
+	}
+	line := l.lines[len(l.lines)-1]
+	l.parent.Synchronize(func() {
+		if line.box == nil || line.box.IsDisposed() {
+			return
+		}
+		_ = line.val.SetFocus()
+	})
+}
+
+func (l *kvList) fitHeight() {
+	if l == nil || l.parent == nil {
+		return
+	}
+	height := 4
+	if l.header != nil {
+		height += 28
+	}
+	height += len(l.lines) * 34
+	if height < 36 {
+		height = 36
+	}
+	_ = l.parent.SetMinMaxSize(walk.Size{Height: height}, walk.Size{Height: height})
+	l.parent.RequestLayout()
+	if form := l.parent.Form(); form != nil {
+		form.RequestLayout()
 	}
 }
 
@@ -468,17 +534,21 @@ func (l *kvList) fitWidth() {
 		return
 	}
 	width := l.parent.ClientBounds().Width - 8
-	if width < 280 || width == l.width {
+	if width < 80 {
 		return
 	}
 	l.fitting = true
-	l.width = width
-	if l.header != nil {
+	if l.header != nil && l.width != width {
 		_ = l.header.SetMinMaxSize(walk.Size{Width: width, Height: 24}, walk.Size{})
 	}
 	for _, line := range l.lines {
+		if line.sized == width {
+			continue
+		}
 		_ = line.box.SetMinMaxSize(walk.Size{Width: width, Height: 30}, walk.Size{})
+		line.sized = width
 	}
+	l.width = width
 	l.fitting = false
 }
 
@@ -496,7 +566,7 @@ func (l *kvList) remove(line *kvLine) {
 		return
 	}
 	l.ensureTrailing()
-	l.parent.RequestLayout()
+	l.fitHeight()
 	if l.onChange != nil {
 		l.onChange()
 	}

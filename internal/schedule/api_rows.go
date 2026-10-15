@@ -132,7 +132,7 @@ func ParseFieldRows(text string) ([]APIRow, error) {
 			}
 			return nil, err
 		}
-		rows = append(rows, APIRow{Enabled: enabled, Key: field.Label, Value: field.Path})
+		rows = append(rows, APIRow{Enabled: enabled, Key: field.Label, Value: field.Spec()})
 	}
 	return rows, nil
 }
