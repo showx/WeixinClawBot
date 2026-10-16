@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/lxn/walk"
 	"github.com/lxn/win"
@@ -16,6 +17,50 @@ import (
 
 	"weixinclawbot/internal/schedule"
 )
+
+// fitDialog 让窗口不超过当前屏幕的工作区，避免编辑时把窗口拖来拖去。
+func fitDialog(dlg *walk.Dialog) {
+	if dlg == nil {
+		return
+	}
+	var info win.MONITORINFO
+	info.CbSize = uint32(unsafe.Sizeof(info))
+	if !win.GetMonitorInfo(win.MonitorFromWindow(dlg.Handle(), win.MONITOR_DEFAULTTONEAREST), &info) {
+		return
+	}
+	limitW := int(info.RcWork.Right-info.RcWork.Left) - dlg.IntFrom96DPI(12)
+	limitH := int(info.RcWork.Bottom-info.RcWork.Top) - dlg.IntFrom96DPI(12)
+	if limitW < dlg.IntFrom96DPI(480) {
+		limitW = dlg.IntFrom96DPI(480)
+	}
+	if limitH < dlg.IntFrom96DPI(320) {
+		limitH = dlg.IntFrom96DPI(320)
+	}
+	min := dlg.MinSizePixels()
+	if min.Width > limitW {
+		min.Width = limitW
+	}
+	if min.Height > limitH {
+		min.Height = limitH
+	}
+	want := walk.Size{
+		Width:  dlg.IntFrom96DPI(760),
+		Height: dlg.IntFrom96DPI(520),
+	}
+	if want.Width > limitW {
+		want.Width = limitW
+	}
+	if want.Height > limitH {
+		want.Height = limitH
+	}
+	if want.Width < min.Width {
+		want.Width = min.Width
+	}
+	if want.Height < min.Height {
+		want.Height = min.Height
+	}
+	_ = dlg.SetMinMaxSizePixels(want, walk.Size{Width: limitW, Height: limitH})
+}
 
 func kvAddButton(text string, onClick func()) Widget {
 	return Composite{
@@ -74,6 +119,7 @@ func (d *desk) tasks() {
 					PushButton{Text: "删除", OnClicked: func() { box.remove() }},
 					PushButton{AssignTo: &runBtn, Text: "现在运行", OnClicked: func() { box.runNow() }},
 					PushButton{Text: "日志", OnClicked: func() { box.showLogs() }},
+					PushButton{Text: "宏", OnClicked: func() { editMacros(dlg, d.book) }},
 					PushButton{Text: "模型", OnClicked: func() { editModel(dlg, d.book) }},
 					HSpacer{},
 					PushButton{Text: "关闭", OnClicked: func() { dlg.Accept() }},
@@ -146,7 +192,7 @@ func (b *taskBox) reload() {
 	labels := make([]string, len(items))
 	index := -1
 	for i, task := range items {
-		labels[i] = task.Summary()
+		labels[i] = schedule.TaskLabel(i+1, task)
 		if task.ID == prev {
 			index = i
 		}
@@ -436,7 +482,7 @@ func editTask(owner walk.Form, book *schedule.Book, accounts []string, current s
 		accounts = []string{}
 	}
 	var dlg *walk.Dialog
-	var nameBox, toBox, atBox, everyBox *walk.LineEdit
+	var nameBox, codeBox, toBox, atBox, everyBox *walk.LineEdit
 	var accountBox *walk.ListBox
 	var modeBox, kindBox *walk.ComboBox
 	var body *walk.TextEdit
@@ -469,14 +515,16 @@ func editTask(owner walk.Form, book *schedule.Book, accounts []string, current s
 		Icon:     appIcon(),
 		Title:    title,
 		Font:     Font{Family: "Microsoft YaHei UI", PointSize: 10},
-		MinSize:  Size{Width: 860, Height: 640},
-		Layout:   VBox{Margins: Margins{Left: 16, Top: 12, Right: 16, Bottom: 12}, Spacing: 8},
+		MinSize:  Size{Width: 720, Height: 420},
+		Layout:   VBox{Margins: Margins{Left: 12, Top: 10, Right: 12, Bottom: 10}, Spacing: 6},
 		Children: []Widget{
 			Composite{
 				Layout: HBox{MarginsZero: true, Spacing: 8},
 				Children: []Widget{
 					Label{Text: "名称", MinSize: Size{Width: 52}},
 					LineEdit{AssignTo: &nameBox, Text: current.Name, CueBanner: "例如 早报", StretchFactor: 1},
+					Label{Text: "查询号"},
+					LineEdit{AssignTo: &codeBox, Text: current.Code, CueBanner: "发这个会立刻重跑", MinSize: Size{Width: 140}},
 					Label{Text: "发给谁"},
 					LineEdit{AssignTo: &toBox, Text: current.To, CueBanner: "留空则每个微信发给自己最近的会话", StretchFactor: 1},
 				},
@@ -485,8 +533,8 @@ func editTask(owner walk.Form, book *schedule.Book, accounts []string, current s
 				Layout: HBox{MarginsZero: true, Spacing: 8},
 				Children: []Widget{
 					Label{Text: "微信", MinSize: Size{Width: 52}},
-					ListBox{AssignTo: &accountBox, Model: accounts, MultiSelection: true, MinSize: Size{Width: 220, Height: 72}},
-					Label{Text: "按住 Ctrl 多选。到点会把同一条内容发给每个选中的微信。", TextColor: walk.RGB(110, 110, 110)},
+					ListBox{AssignTo: &accountBox, Model: accounts, MultiSelection: true, MinSize: Size{Width: 180, Height: 52}},
+					Label{Text: "按住 Ctrl 多选。到点会把同一条内容发给每个选中的微信。", TextColor: walk.RGB(110, 110, 110), MaxSize: Size{Width: 360}},
 				},
 			},
 			Composite{
@@ -512,86 +560,95 @@ func editTask(owner walk.Form, book *schedule.Book, accounts []string, current s
 					},
 				},
 			},
-			Label{AssignTo: &hint, Text: "到点把这段文字发给上面的微信。", TextColor: walk.RGB(110, 110, 110)},
-			TextEdit{AssignTo: &body, Text: current.Body, StretchFactor: 1, MinSize: Size{Height: 160}, VScroll: true},
-			Composite{
-				AssignTo:      &apiPanel,
-				Visible:       false,
-				Layout:        VBox{MarginsZero: true},
-				StretchFactor: 1,
+			ScrollView{
+				HorizontalFixed: true,
+				StretchFactor:   1,
+				MinSize:         Size{Height: 160},
+				MaxSize:         Size{Width: 700},
+				Layout:          VBox{MarginsZero: true, Spacing: 6},
 				Children: []Widget{
+					Label{AssignTo: &hint, Text: "到点把这段文字发给上面的微信。", TextColor: walk.RGB(110, 110, 110), MaxSize: Size{Width: 680}},
+					TextEdit{AssignTo: &body, Text: current.Body, StretchFactor: 1, MinSize: Size{Height: 120}, VScroll: true},
 					Composite{
-						Layout: HBox{MarginsZero: true, Spacing: 8},
-						Children: []Widget{
-							ComboBox{AssignTo: &method, Model: []string{"GET", "POST"}, MinSize: Size{Width: 88}},
-							LineEdit{AssignTo: &urlBox, CueBanner: "https://example.com/api", StretchFactor: 1, OnTextChanged: func() { studio.onURL() }},
-							PushButton{AssignTo: &sendBtn, Text: "发送", MinSize: Size{Width: 84}, OnClicked: func() { studio.send() }},
-						},
-					},
-					TabWidget{
+						AssignTo:      &apiPanel,
+						Visible:       false,
+						Layout:        VBox{MarginsZero: true},
 						StretchFactor: 1,
-						MinSize:       Size{Height: 210},
-						Pages: []TabPage{
-							{
-								Title:  "参数",
-								Layout: VBox{Margins: Margins{Left: 8, Top: 8, Right: 8, Bottom: 8}, Spacing: 6},
-								Children: []Widget{
-									Composite{AssignTo: &paramScroll, Layout: VBox{MarginsZero: true, Spacing: 4, Alignment: AlignHNearVNear}},
-									kvAddButton("添加参数", func() { studio.params.add(schedule.APIRow{Enabled: true}) }),
-								},
-							},
-							{
-								Title:  "请求头",
-								Layout: VBox{Margins: Margins{Left: 8, Top: 8, Right: 8, Bottom: 8}, Spacing: 6},
-								Children: []Widget{
-									Composite{AssignTo: &headerScroll, Layout: VBox{MarginsZero: true, Spacing: 4, Alignment: AlignHNearVNear}},
-									kvAddButton("添加请求头", func() { studio.headers.add(schedule.APIRow{Enabled: true}) }),
-								},
-							},
-							{
-								Title:  "正文",
-								Layout: VBox{Margins: Margins{Left: 8, Top: 8, Right: 8, Bottom: 8}, Spacing: 6},
-								Children: []Widget{
-									Label{Text: "只有 POST 会发送。以 { 或 [ 开头时，自动按 JSON 提交。", TextColor: walk.RGB(110, 110, 110)},
-									TextEdit{AssignTo: &apiBody, VScroll: true, StretchFactor: 1, Font: Font{Family: "Consolas", PointSize: 10}},
-								},
-							},
-							{
-								Title:  "字段",
-								Layout: VBox{Margins: Margins{Left: 8, Top: 8, Right: 8, Bottom: 8}, Spacing: 6},
-								Children: []Widget{
-									Composite{AssignTo: &fieldScroll, Layout: VBox{MarginsZero: true, Spacing: 4, Alignment: AlignHNearVNear}},
-									Composite{
-										Layout: HBox{MarginsZero: true, Spacing: 8},
-										Children: []Widget{
-											PushButton{Text: "添加字段", OnClicked: func() { studio.addField() }},
-											Label{Text: "单位接在后面：data.list.*.amount元；分先换算：data.list.*.cost/100元", TextColor: walk.RGB(110, 110, 110)},
-											HSpacer{},
-										},
-									},
-									Label{Text: "发送后可从返回里加入", TextColor: walk.RGB(110, 110, 110)},
-									ListBox{AssignTo: &choices, Model: choiceModel, MultiSelection: true, MinSize: Size{Height: 72}, MaxSize: Size{Height: 72}},
-									Composite{
-										Layout: HBox{MarginsZero: true, Spacing: 8},
-										Children: []Widget{
-											PushButton{Text: "加入选中的字段", OnClicked: func() { studio.takeSelected() }},
-											PushButton{Text: "全部加入", OnClicked: func() { studio.takeAll() }},
-											HSpacer{},
-										},
-									},
-								},
-							},
-						},
-					},
-					Composite{
-						Layout: HBox{MarginsZero: true, Spacing: 8},
 						Children: []Widget{
-							Label{Text: "返回", TextColor: walk.RGB(80, 80, 80)},
-							Label{AssignTo: &apiStatus, Text: "还没有发送", TextColor: walk.RGB(80, 80, 80)},
-							HSpacer{},
+							Composite{
+								Layout: HBox{MarginsZero: true, Spacing: 8},
+								Children: []Widget{
+									ComboBox{AssignTo: &method, Model: []string{"GET", "POST"}, MinSize: Size{Width: 88}},
+									LineEdit{AssignTo: &urlBox, CueBanner: "https://example.com/api", StretchFactor: 1, OnTextChanged: func() { studio.onURL() }},
+									PushButton{AssignTo: &sendBtn, Text: "发送", MinSize: Size{Width: 84}, OnClicked: func() { studio.send() }},
+								},
+							},
+							TabWidget{
+								StretchFactor: 1,
+								MinSize:       Size{Height: 160},
+								Pages: []TabPage{
+									{
+										Title:  "参数",
+										Layout: VBox{Margins: Margins{Left: 8, Top: 8, Right: 8, Bottom: 8}, Spacing: 6},
+										Children: []Widget{
+											Composite{AssignTo: &paramScroll, Layout: VBox{MarginsZero: true, Spacing: 4, Alignment: AlignHNearVNear}},
+											kvAddButton("添加参数", func() { studio.params.add(schedule.APIRow{Enabled: true}) }),
+										},
+									},
+									{
+										Title:  "请求头",
+										Layout: VBox{Margins: Margins{Left: 8, Top: 8, Right: 8, Bottom: 8}, Spacing: 6},
+										Children: []Widget{
+											Composite{AssignTo: &headerScroll, Layout: VBox{MarginsZero: true, Spacing: 4, Alignment: AlignHNearVNear}},
+											kvAddButton("添加请求头", func() { studio.headers.add(schedule.APIRow{Enabled: true}) }),
+										},
+									},
+									{
+										Title:  "正文",
+										Layout: VBox{Margins: Margins{Left: 8, Top: 8, Right: 8, Bottom: 8}, Spacing: 6},
+										Children: []Widget{
+											Label{Text: "只有 POST 会发送。以 { 或 [ 开头时，自动按 JSON 提交。", TextColor: walk.RGB(110, 110, 110)},
+											TextEdit{AssignTo: &apiBody, VScroll: true, StretchFactor: 1, Font: Font{Family: "Consolas", PointSize: 10}},
+										},
+									},
+									{
+										Title:  "字段",
+										Layout: VBox{Margins: Margins{Left: 8, Top: 8, Right: 8, Bottom: 8}, Spacing: 6},
+										Children: []Widget{
+											Composite{AssignTo: &fieldScroll, Layout: VBox{MarginsZero: true, Spacing: 4, Alignment: AlignHNearVNear}},
+											Composite{
+												Layout: HBox{MarginsZero: true, Spacing: 8},
+												Children: []Widget{
+													PushButton{Text: "添加字段", OnClicked: func() { studio.addField() }},
+													Label{Text: "单位接在后面：data.list.*.amount元；分先换算：data.list.*.cost/100元", TextColor: walk.RGB(110, 110, 110), MaxSize: Size{Width: 420}},
+													HSpacer{},
+												},
+											},
+											Label{Text: "发送后可从返回里加入", TextColor: walk.RGB(110, 110, 110)},
+											ListBox{AssignTo: &choices, Model: choiceModel, MultiSelection: true, MinSize: Size{Height: 72}, MaxSize: Size{Height: 72}},
+											Composite{
+												Layout: HBox{MarginsZero: true, Spacing: 8},
+												Children: []Widget{
+													PushButton{Text: "加入选中的字段", OnClicked: func() { studio.takeSelected() }},
+													PushButton{Text: "全部加入", OnClicked: func() { studio.takeAll() }},
+													HSpacer{},
+												},
+											},
+										},
+									},
+								},
+							},
+							Composite{
+								Layout: HBox{MarginsZero: true, Spacing: 8},
+								Children: []Widget{
+									Label{Text: "返回", TextColor: walk.RGB(80, 80, 80)},
+									Label{AssignTo: &apiStatus, Text: "还没有发送", TextColor: walk.RGB(80, 80, 80)},
+									HSpacer{},
+								},
+							},
+							TextEdit{AssignTo: &response, ReadOnly: true, VScroll: true, HScroll: true, StretchFactor: 1, MinSize: Size{Height: 96}, Font: Font{Family: "Consolas", PointSize: 10}},
 						},
 					},
-					TextEdit{AssignTo: &response, ReadOnly: true, VScroll: true, HScroll: true, StretchFactor: 1, MinSize: Size{Height: 120}, Font: Font{Family: "Consolas", PointSize: 10}},
 				},
 			},
 			Composite{
@@ -609,6 +666,7 @@ func editTask(owner walk.Form, book *schedule.Book, accounts []string, current s
 			Composite{
 				Layout: HBox{},
 				Children: []Widget{
+					PushButton{Text: "宏", OnClicked: func() { editMacros(dlg, book) }},
 					PushButton{Text: "模型", OnClicked: func() {
 						editModel(dlg, book)
 						editor.applyKind()
@@ -628,6 +686,7 @@ func editTask(owner walk.Form, book *schedule.Book, accounts []string, current s
 	editor.book = book
 	editor.current = current
 	editor.name = nameBox
+	editor.code = codeBox
 	editor.to = toBox
 	editor.at = atBox
 	editor.every = everyBox
@@ -645,6 +704,9 @@ func editTask(owner walk.Form, book *schedule.Book, accounts []string, current s
 	editor.atLabel = atLabel
 	editor.everyLabel = everyLabel
 	editor.apiPanel = apiPanel
+	if book != nil {
+		studio.dir = book.Dir()
+	}
 	studio.owner = dlg
 	studio.method = method
 	studio.url = urlBox
@@ -677,6 +739,7 @@ func editTask(owner walk.Form, book *schedule.Book, accounts []string, current s
 	_ = kindBox.SetCurrentIndex(kindIndex)
 	editor.applyMode()
 	editor.applyKind()
+	fitDialog(dlg)
 	if len(accounts) == 0 {
 		errLabel.SetText("还没有微信。先在主窗口添加一个，再保存任务。")
 	}
@@ -689,6 +752,7 @@ type taskEditor struct {
 	current    schedule.Task
 	accounts   []string
 	name       *walk.LineEdit
+	code       *walk.LineEdit
 	to         *walk.LineEdit
 	at         *walk.LineEdit
 	every      *walk.LineEdit
@@ -744,7 +808,7 @@ func (e *taskEditor) applyKind() {
 	api := e.kind.CurrentIndex() == 3
 	e.showAPI(api)
 	if api {
-		e.hint.SetText("不勾选字段时，把返回的 JSON 直接发给微信。勾选后只发选中的路径。同一名单的几列会排成一行。单位直接接在字段后面，例如 data.list.*.amount元。金额如果是分，先写 /100 再写单位，例如 data.list.*.cost/100元；要乘以某个数就写成 *100。{today}、{yesterday} 换成 20261014 这种；{today-yyyy-mm-dd}、{yesterday-yyyy-mm-dd} 换成 2026-10-14 这种。")
+		e.hint.SetText("不勾选字段时，把返回的 JSON 直接发给微信。勾选后只发选中的路径。同一名单的几列会排成一行。单位直接接在字段后面，例如 data.list.*.amount元。金额如果是分，先写 /100 再写单位，例如 data.list.*.cost/100元；要乘以某个数就写成 *100。{today}、{yesterday} 换成 20261014 这种；{today-yyyy-mm-dd}、{yesterday-yyyy-mm-dd} 换成 2026-10-14 这种。共用的参数写成 {token}，到「宏」里改一次即可。")
 		return
 	}
 	switch e.kind.CurrentIndex() {
@@ -769,6 +833,9 @@ func (e *taskEditor) applyKind() {
 func (e *taskEditor) save() {
 	task := e.current
 	task.Name = e.name.Text()
+	if e.code != nil {
+		task.Code = e.code.Text()
+	}
 	task.To = e.to.Text()
 	task.Enabled = e.enabled.Checked()
 	task.ShowTime = e.showTime.Checked()
@@ -878,6 +945,209 @@ func (e *taskEditor) loadAPIForm() {
 	}
 	e.apiLoaded = true
 	e.api.load(e.body.Text())
+}
+
+func editMacros(owner walk.Form, book *schedule.Book) {
+	if book == nil {
+		return
+	}
+	box := &macroBox{book: book, model: &textModel{}}
+	var dlg *walk.Dialog
+	var list *walk.ListBox
+	var detail *walk.Label
+	var value *walk.TextEdit
+	err := (Dialog{
+		AssignTo: &dlg,
+		Icon:     appIcon(),
+		Title:    "宏",
+		Font:     Font{Family: "Microsoft YaHei UI", PointSize: 10},
+		MinSize:  Size{Width: 560, Height: 420},
+		Layout:   VBox{},
+		Children: []Widget{
+			Label{Text: "任务里写 {名称}。改一个宏，用到它的任务都会换成新值。"},
+			ListBox{
+				AssignTo:              &list,
+				Model:                 box.model,
+				MinSize:               Size{Height: 160},
+				OnCurrentIndexChanged: func() { box.show() },
+			},
+			Label{AssignTo: &detail, Text: "还没有宏。"},
+			TextEdit{AssignTo: &value, ReadOnly: true, VScroll: true, Text: "点「新建」添加一个，例如名称 token。"},
+			Composite{
+				Layout: HBox{},
+				Children: []Widget{
+					PushButton{Text: "新建", OnClicked: func() { box.create() }},
+					PushButton{Text: "编辑", OnClicked: func() { box.edit() }},
+					PushButton{Text: "删除", OnClicked: func() { box.remove() }},
+					HSpacer{},
+					PushButton{Text: "关闭", OnClicked: func() { dlg.Accept() }},
+				},
+			},
+		},
+	}).Create(owner)
+	if err != nil {
+		walk.MsgBox(owner, "宏", err.Error(), walk.MsgBoxIconError)
+		return
+	}
+	box.dlg = dlg
+	box.list = list
+	box.detail = detail
+	box.value = value
+	box.reload("")
+	dlg.Run()
+}
+
+type macroBox struct {
+	book   *schedule.Book
+	dlg    *walk.Dialog
+	list   *walk.ListBox
+	detail *walk.Label
+	value  *walk.TextEdit
+	model  *textModel
+	items  []schedule.Macro
+}
+
+func (b *macroBox) reload(selectName string) {
+	items, err := schedule.LoadMacros(b.book.Dir())
+	if err != nil {
+		b.detail.SetText(err.Error())
+		return
+	}
+	if selectName == "" {
+		if item, _, ok := b.selected(); ok {
+			selectName = item.Name
+		}
+	}
+	b.items = items
+	labels := make([]string, len(items))
+	index := -1
+	for i, item := range items {
+		labels[i] = item.Name
+		if item.Name == selectName {
+			index = i
+		}
+	}
+	if index < 0 && len(items) > 0 {
+		index = 0
+	}
+	b.model.items = labels
+	b.model.PublishItemsReset()
+	_ = b.list.SetCurrentIndex(index)
+	b.show()
+}
+
+func (b *macroBox) show() {
+	item, _, ok := b.selected()
+	if !ok {
+		if len(b.items) == 0 {
+			b.detail.SetText("还没有宏。")
+			_ = b.value.SetText("点「新建」添加一个，例如名称 token。任务里写 {token}。")
+			return
+		}
+		b.detail.SetText("选一个宏可以查看。")
+		_ = b.value.SetText("")
+		return
+	}
+	b.detail.SetText("任务里写 {" + item.Name + "}")
+	_ = b.value.SetText(item.Value)
+}
+
+func (b *macroBox) selected() (schedule.Macro, int, bool) {
+	index := b.list.CurrentIndex()
+	if index < 0 || index >= len(b.items) {
+		return schedule.Macro{}, -1, false
+	}
+	return b.items[index], index, true
+}
+
+func (b *macroBox) create() {
+	var saved string
+	if editMacroItem(b.dlg, "新建宏", schedule.Macro{}, func(item schedule.Macro) error {
+		saved = strings.TrimSpace(item.Name)
+		next := append([]schedule.Macro{}, b.items...)
+		next = append(next, item)
+		return schedule.SaveMacros(b.book.Dir(), next)
+	}) {
+		b.reload(saved)
+	}
+}
+
+func (b *macroBox) edit() {
+	current, index, ok := b.selected()
+	if !ok {
+		b.detail.SetText("先选一个宏。")
+		return
+	}
+	var saved string
+	if editMacroItem(b.dlg, "编辑宏", current, func(item schedule.Macro) error {
+		saved = strings.TrimSpace(item.Name)
+		next := append([]schedule.Macro{}, b.items...)
+		next[index] = item
+		return schedule.SaveMacros(b.book.Dir(), next)
+	}) {
+		b.reload(saved)
+	}
+}
+
+func (b *macroBox) remove() {
+	current, index, ok := b.selected()
+	if !ok {
+		b.detail.SetText("先选一个宏。")
+		return
+	}
+	if walk.MsgBox(b.dlg, "删除宏", "删除「"+current.Name+"」？\n用到 {"+current.Name+"} 的任务不会再换成这个值。", walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != win.IDYES {
+		return
+	}
+	next := append([]schedule.Macro{}, b.items[:index]...)
+	next = append(next, b.items[index+1:]...)
+	if err := schedule.SaveMacros(b.book.Dir(), next); err != nil {
+		b.detail.SetText(err.Error())
+		return
+	}
+	b.reload("")
+}
+
+func editMacroItem(owner walk.Form, title string, current schedule.Macro, save func(schedule.Macro) error) bool {
+	var dlg *walk.Dialog
+	var nameBox *walk.LineEdit
+	var valueBox *walk.TextEdit
+	var errLabel *walk.Label
+	err := (Dialog{
+		AssignTo: &dlg,
+		Icon:     appIcon(),
+		Title:    title,
+		Font:     Font{Family: "Microsoft YaHei UI", PointSize: 10},
+		MinSize:  Size{Width: 480, Height: 320},
+		Layout:   VBox{},
+		Children: []Widget{
+			Label{Text: "名称"},
+			LineEdit{AssignTo: &nameBox, Text: current.Name, CueBanner: "例如 token"},
+			Label{Text: "值"},
+			TextEdit{AssignTo: &valueBox, Text: current.Value, VScroll: true, StretchFactor: 1},
+			Label{Text: "任务里写 {名称}。名称保存后不要随便改，不然原来的任务对不上。"},
+			Label{AssignTo: &errLabel},
+			Composite{
+				Layout: HBox{},
+				Children: []Widget{
+					HSpacer{},
+					PushButton{Text: "取消", OnClicked: func() { dlg.Cancel() }},
+					PushButton{Text: "保存", OnClicked: func() {
+						item := schedule.Macro{Name: nameBox.Text(), Value: valueBox.Text()}
+						if err := save(item); err != nil {
+							errLabel.SetText(err.Error())
+							return
+						}
+						dlg.Accept()
+					}},
+				},
+			},
+		},
+	}).Create(owner)
+	if err != nil {
+		walk.MsgBox(owner, "宏", err.Error(), walk.MsgBoxIconError)
+		return false
+	}
+	return dlg.Run() == walk.DlgCmdOK
 }
 
 func editModel(owner walk.Form, book *schedule.Book) {

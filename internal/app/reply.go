@@ -43,17 +43,40 @@ func (a *App) AckIncoming(msg Incoming, done func(reply string, err error)) {
 	if a == nil || strings.TrimSpace(msg.UserID) == "" || IsReceivedReply(msg.Text) {
 		return
 	}
+	a.ReplyIncoming(msg, ReceivedReply(time.Now()), done)
+}
+
+// ReplyIncoming 把指定文字回给刚发来消息的人。自己的回执不会再回。
+func (a *App) ReplyIncoming(msg Incoming, text string, done func(reply string, err error)) {
+	text = strings.TrimSpace(text)
+	if a == nil || strings.TrimSpace(msg.UserID) == "" || text == "" || IsReceivedReply(msg.Text) {
+		return
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		reply, err := a.ReplyReceived(ctx, msg.Account, msg.UserID, msg.Text)
+		var err error
+		if strings.TrimSpace(msg.Account) != "" && a.Catalog != nil {
+			_, err = a.SendAccount(ctx, msg.Account, msg.UserID, text)
+		} else {
+			_, err = a.Send(ctx, msg.UserID, text)
+		}
 		if err != nil {
-			a.logf("回复收到失败 %s：%v", msg.UserID, err)
-		} else if reply != "" {
-			a.logf("已回复 %s：%s", msg.UserID, reply)
+			a.logf("回复失败 %s：%v", msg.UserID, err)
+		} else {
+			a.logf("已回复 %s：%s", msg.UserID, briefReply(text))
 		}
 		if done != nil {
-			done(reply, err)
+			done(text, err)
 		}
 	}()
+}
+
+func briefReply(text string) string {
+	text = strings.Join(strings.Fields(text), " ")
+	runes := []rune(text)
+	if len(runes) <= 80 {
+		return text
+	}
+	return string(runes[:80]) + "…"
 }

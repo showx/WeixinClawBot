@@ -103,6 +103,7 @@ func (b *Book) Get(id string) (Task, bool, error) {
 // 更新时保留上次运行时间和结果。
 func (b *Book) Save(task Task) (Task, error) {
 	task.Name = strings.TrimSpace(task.Name)
+	task.Code = strings.TrimSpace(task.Code)
 	task.Account = strings.TrimSpace(task.Account)
 	task.To = strings.TrimSpace(task.To)
 	task.Body = strings.TrimSpace(task.Body)
@@ -145,6 +146,9 @@ func (b *Book) Save(task Task) (Task, error) {
 		if !found {
 			return Task{}, errors.New("没有这个定时任务")
 		}
+	}
+	if err := uniqueCode(stored.Tasks, task); err != nil {
+		return Task{}, err
 	}
 	if err := b.write(stored); err != nil {
 		return Task{}, err
@@ -246,6 +250,22 @@ func (b *Book) release(id string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	delete(b.running, id)
+}
+
+func uniqueCode(tasks []Task, task Task) error {
+	code := strings.TrimSpace(task.Code)
+	if code == "" {
+		return nil
+	}
+	for _, old := range tasks {
+		if old.ID == task.ID {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(old.Code), code) {
+			return fmt.Errorf("查询号「%s」已被「%s」使用", code, old.Name)
+		}
+	}
+	return nil
 }
 
 func newID() string {

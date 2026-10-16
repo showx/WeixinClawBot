@@ -17,12 +17,12 @@ func TestCopyTask(t *testing.T) {
 	src := Task{
 		ID: "a", Name: "魔光后台", Account: "工作", Accounts: []string{"工作", "生活"},
 		Kind: KindAPI, Body: "https://example.com\ndata.sum",
-		ShowTime: true, Prefix: "下午汇总",
+		ShowTime: true, Prefix: "下午汇总", Code: "zaobao",
 		Mode: ModeDaily, At: "08:30", Enabled: true,
 		LastRun: time.Now(), LastResult: "已发送",
 	}
 	next := src.Copy()
-	if next.ID != "" || !next.LastRun.IsZero() || next.LastResult != "" {
+	if next.ID != "" || next.Code != "" || !next.LastRun.IsZero() || next.LastResult != "" {
 		t.Fatalf("副本不应带上运行记录: %+v", next)
 	}
 	if next.Name != "魔光后台 副本" || next.Body != src.Body || !next.ShowTime || next.Prefix != src.Prefix {

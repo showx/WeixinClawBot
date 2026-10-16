@@ -78,6 +78,7 @@ type apiStudio struct {
 	choices     *walk.ListBox
 	choiceModel *textModel
 	choicePaths []string
+	dir         string
 	sendBtn     *walk.PushButton
 	params      *kvList
 	headers     *kvList
@@ -170,6 +171,12 @@ func (s *apiStudio) send() {
 		s.status.SetText(err.Error())
 		return
 	}
+	items, err := schedule.LoadMacros(s.dir)
+	if err != nil {
+		s.status.SetText(err.Error())
+		return
+	}
+	text = schedule.ExpandMacros(text, items)
 	s.sending = true
 	s.sendBtn.SetEnabled(false)
 	s.status.SetText("正在发送…")

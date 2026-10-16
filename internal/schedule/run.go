@@ -99,6 +99,11 @@ func (b *Book) run(ctx context.Context, task Task, send SendFunc, manual bool) (
 	if !manual && !fresh.Due(time.Now()) {
 		return "", nil
 	}
+	fresh, err = b.applyMacros(fresh)
+	if err != nil {
+		log.Printf("定时任务 %s 没能读取宏: %v", fresh.Name, err)
+		return "", err
+	}
 
 	text, result, shouldSend := b.produce(ctx, fresh)
 	if ctx.Err() != nil {

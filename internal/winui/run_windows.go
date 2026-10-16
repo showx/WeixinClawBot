@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"image/png"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -61,7 +62,7 @@ func run(application *app.App, listen, token string) error {
 		}
 		application.SetOnIncoming(func(msg app.Incoming) {
 			book.AddPhone(msg.Account, msg.UserID, msg.Text)
-			application.AckIncoming(msg, func(reply string, err error) {
+			go answerIncoming(application, book, msg, func(reply string, err error) {
 				noteAck(book, msg, reply, err)
 			})
 		})
@@ -109,7 +110,7 @@ func openWindow(application *app.App, book *schedule.Book, ctx context.Context, 
 			Composite{
 				Layout: HBox{MarginsZero: true},
 				Children: []Widget{
-					Label{Text: "窗口开着就会监听微信。对方发来消息会自动回复「收到」和当前时间。勾选「到点执行」后，定时任务才会自动发。"},
+					Label{Text: "窗口开着就会监听微信。普通消息回复「收到」和时间；发来任务序号或查询号，会立刻重跑并把这次的结果发回去。勾选「到点执行」后，定时任务才会自动发。"},
 					HSpacer{},
 					CheckBox{AssignTo: &ui.scheduleOn, Text: "到点执行", Checked: scheduleOn, Enabled: book != nil, OnCheckedChanged: ui.onScheduleSwitch},
 					PushButton{Text: "定时任务", OnClicked: ui.tasks},
@@ -697,6 +698,27 @@ func (d *desk) syncScheduleSwitch() {
 	d.scheduleQuiet = true
 	d.scheduleOn.SetChecked(on)
 	d.scheduleQuiet = false
+}
+
+func answerIncoming(application *app.App, book *schedule.Book, msg app.Incoming, done func(string, error)) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	reply, ok, err := book.Answer(ctx, msg.Text)
+	if err != nil {
+		log.Printf("查询定时任务失败: %v", err)
+		if strings.TrimSpace(reply) == "" {
+			reply = "运行失败：" + strings.TrimSpace(err.Error())
+			ok = true
+		}
+	}
+	if ok {
+		if strings.TrimSpace(reply) == "" {
+			reply = "这次没有内容"
+		}
+		application.ReplyIncoming(msg, reply, done)
+		return
+	}
+	application.AckIncoming(msg, done)
 }
 
 func noteAck(book *schedule.Book, msg app.Incoming, reply string, err error) {

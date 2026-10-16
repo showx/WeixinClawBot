@@ -246,7 +246,7 @@ func serveLoop(application *app.App, listen, token string, watch func(context.Co
 		} else {
 			application.SetOnIncoming(func(msg app.Incoming) {
 				book.AddPhone(msg.Account, msg.UserID, msg.Text)
-				application.AckIncoming(msg, nil)
+				go answerIncoming(application, book, msg, nil)
 			})
 			go book.Loop(ctx, func(ctx context.Context, account, to, text string) error {
 				_, err := application.SendAccount(ctx, account, to, text)
@@ -355,6 +355,27 @@ func cmdSessions(args []string) error {
 		}
 	}
 	return nil
+}
+
+func answerIncoming(application *app.App, book *schedule.Book, msg app.Incoming, done func(string, error)) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	reply, ok, err := book.Answer(ctx, msg.Text)
+	if err != nil {
+		log.Printf("查询定时任务失败: %v", err)
+		if strings.TrimSpace(reply) == "" {
+			reply = "运行失败：" + strings.TrimSpace(err.Error())
+			ok = true
+		}
+	}
+	if ok {
+		if strings.TrimSpace(reply) == "" {
+			reply = "这次没有内容"
+		}
+		application.ReplyIncoming(msg, reply, done)
+		return
+	}
+	application.AckIncoming(msg, done)
 }
 
 func openApp(dir string) (*app.App, error) {

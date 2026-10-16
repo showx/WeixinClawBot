@@ -25,6 +25,7 @@ const (
 // Task 是一条定时任务。接收者为空时，发给该微信最近的会话。
 type Task struct {
 	ID           string    `json:"id"`
+	Code         string    `json:"code,omitempty"`
 	Name         string    `json:"name"`
 	Account      string    `json:"account"`
 	Accounts     []string  `json:"accounts,omitempty"`
@@ -93,6 +94,13 @@ func (t Task) Validate() error {
 	}
 	if utf8.RuneCountInString(strings.TrimSpace(t.Prefix)) > 200 {
 		return fmt.Errorf("附言最多 200 个字")
+	}
+	code := strings.TrimSpace(t.Code)
+	if utf8.RuneCountInString(code) > 32 {
+		return fmt.Errorf("查询号最多 32 个字")
+	}
+	if strings.ContainsAny(code, " \t\r\n") {
+		return fmt.Errorf("查询号不能包含空格")
 	}
 	switch t.Kind {
 	case KindText, KindCommand, KindPage, KindAPI, KindBrowse:
@@ -177,6 +185,14 @@ func (t Task) Summary() string {
 	return fmt.Sprintf("%s%s  %s  %s → %s", t.Name, state, when, t.AccountLabel(), target)
 }
 
+// TaskLabel 是任务列表里的一行，前面带从 1 开始的序号。有查询号时写在序号后面。
+func TaskLabel(n int, task Task) string {
+	if code := strings.TrimSpace(task.Code); code != "" {
+		return fmt.Sprintf("%d  %s  %s", n, code, task.Summary())
+	}
+	return fmt.Sprintf("%d  %s", n, task.Summary())
+}
+
 // AccountNames 是这个任务要发送的微信。旧任务只写了 account 时仍然有效。
 func (t Task) AccountNames() []string {
 	seen := map[string]bool{}
@@ -204,6 +220,7 @@ func (t Task) Copy() Task {
 		t.Accounts = append([]string(nil), t.Accounts...)
 	}
 	t.ID = ""
+	t.Code = ""
 	t.LastRun = time.Time{}
 	t.LastResult = ""
 	t.Name = copyName(t.Name)
@@ -255,7 +272,11 @@ func (t Task) Detail() string {
 	if result == "" {
 		result = "无结果"
 	}
-	return kind + "。" + when + "：" + result
+	line := kind + "。" + when + "：" + result
+	if code := strings.TrimSpace(t.Code); code != "" {
+		line += "。查询号 " + code
+	}
+	return line
 }
 
 func todaySlot(now time.Time, at string) (time.Time, bool) {
